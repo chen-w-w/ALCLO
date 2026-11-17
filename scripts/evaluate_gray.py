@@ -82,18 +82,17 @@ def default_score_checkpoint():
 # Attack definitions, quality metrics and tables are unchanged from evaluate.py.
 
 class AttackLibrary:
-    """
-    攻击库: 包含已见攻击和未见攻击的统一接口。
+    """Unified image distortion interface for evaluation.
 
-    所有攻击函数签名: attack(image_tensor) -> attacked_tensor
-    输入输出均为 (B, C, H, W) 范围 [0, 1] 的 float tensor。
+    Each attack maps float tensors shaped (B, C, H, W) in [0, 1] to attacked
+    tensors of the same shape.
     """
 
-    # ---------- 已见攻击 (训练噪声池中的 6 种) ----------
+    # ---------- Seen attacks: six distortions from the training pool ----------
 
     @staticmethod
     def jpeg(x, quality=50):
-        """JPEG 压缩 (逐张处理，用 PIL 实现)"""
+        """Apply JPEG compression to each image using Pillow."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -112,18 +111,18 @@ class AttackLibrary:
 
     @staticmethod
     def gaussian_noise(x, sigma=0.15):
-        """高斯噪声"""
+        """Add Gaussian noise."""
         return torch.clamp(x + torch.randn_like(x) * sigma, 0, 1)
 
     @staticmethod
     def gaussian_blur(x, sigma=3.0):
-        """高斯模糊"""
-        kernel_size = int(6 * sigma + 1) | 1  # 确保奇数
+        """Apply Gaussian blur."""
+        kernel_size = int(6 * sigma + 1) | 1  # Ensure an odd kernel size.
         return transforms.GaussianBlur(kernel_size, sigma)(x)
 
     @staticmethod
     def salt_pepper(x, p=0.3):
-        """椒盐噪声"""
+        """Add salt-and-pepper noise."""
         mask = torch.rand_like(x)
         result = x.clone()
         result[mask < p / 2] = 0.0
@@ -132,7 +131,7 @@ class AttackLibrary:
 
     @staticmethod
     def median_filter(x, kernel_size=9):
-        """中值滤波 (逐张处理)"""
+        """Apply a median filter to each image."""
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
         for i in range(B):
@@ -144,15 +143,15 @@ class AttackLibrary:
 
     @staticmethod
     def dropout(x, p=0.5):
-        """随机丢弃像素 (置零)"""
+        """Randomly set pixels to zero."""
         mask = (torch.rand_like(x) > p).float()
         return x * mask
 
-    # ---------- 未见攻击 (训练时从未出现) ----------
+    # ---------- Unseen attack benchmark group ----------
 
     @staticmethod
     def mean_filter(x, kernel_size=5):
-        """均值滤波"""
+        """Apply a mean filter."""
         C = x.shape[1]
         kernel = torch.ones(C, 1, kernel_size, kernel_size, device=x.device) / (kernel_size ** 2)
         pad = kernel_size // 2
@@ -160,7 +159,7 @@ class AttackLibrary:
 
     @staticmethod
     def sharpen(x, strength=1.0):
-        """锐化"""
+        """Sharpen the image."""
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
         for i in range(B):
@@ -168,24 +167,24 @@ class AttackLibrary:
             pil_img = transforms.ToPILImage()(img)
             sharp = pil_img.filter(ImageFilter.SHARPEN)
             sharp_t = transforms.ToTensor()(sharp).to(x.device)
-            # 按 strength 混合
+            # Blend according to strength.
             result[i] = torch.clamp(x[i] + strength * (sharp_t - x[i]), 0, 1)
         return result
 
     @staticmethod
     def brightness(x, delta=20):
-        """亮度调整 (delta 为像素值偏移量，范围 0-255 尺度)"""
+        """Adjust brightness using a pixel offset on the 0-255 scale."""
         return torch.clamp(x + delta / 255.0, 0, 1)
 
     @staticmethod
     def contrast(x, factor=0.8):
-        """对比度调整"""
+        """Adjust contrast."""
         mean = x.mean(dim=[2, 3], keepdim=True)
         return torch.clamp(mean + factor * (x - mean), 0, 1)
 
     @staticmethod
     def poisson_noise(x, lam=30.0):
-        """泊松噪声"""
+        """Add Poisson noise."""
         # noisy = torch.poisson(x * lam) / lam
         noisy = torch.poisson(torch.clamp(x * lam,min=0.0)) / lam
 
@@ -193,7 +192,7 @@ class AttackLibrary:
 
     @staticmethod
     def webp(x, quality=50):
-        """WebP 压缩"""
+        """Apply WebP compression."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -209,14 +208,14 @@ class AttackLibrary:
 
     @staticmethod
     def resize_attack(x, scale=0.5):
-        """缩放攻击: 缩小再放大"""
+        """Downsample and resize back to the original dimensions."""
         _, _, H, W = x.shape
         small = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
         return F.interpolate(small, size=(H, W), mode='bilinear', align_corners=False)
 
     @staticmethod
     def rotation(x, angle=5.0):
-        """小角度旋转 (旋转后裁剪回原尺寸,中心对齐)"""
+        """Rotate by a small angle and center-crop to the original dimensions."""
         B, C, H, W = x.shape
         theta = torch.tensor([
             [np.cos(np.deg2rad(angle)), -np.sin(np.deg2rad(angle)), 0],
@@ -228,7 +227,7 @@ class AttackLibrary:
 
     @staticmethod
     def center_crop_resize(x, crop_ratio=0.8):
-        """中心裁剪再放大回原尺寸"""
+        """Center-crop and resize back to the original dimensions."""
         _, _, H, W = x.shape
         ch, cw = int(H * crop_ratio), int(W * crop_ratio)
         top, left = (H - ch) // 2, (W - cw) // 2
@@ -237,7 +236,7 @@ class AttackLibrary:
 
     @staticmethod
     def jpeg2000(x, quality=30):
-        """JPEG2000 压缩 (通过 PIL 的 JP2 编码)"""
+        """Apply JPEG2000 compression using Pillow's JP2 codec."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -257,7 +256,7 @@ class AttackLibrary:
 
     @staticmethod
     def motion_blur(x, kernel_size=9):
-        """运动模糊 (水平方向)"""
+        """Apply horizontal motion blur."""
         C = x.shape[1]
         kernel = torch.zeros(C, 1, kernel_size, kernel_size, device=x.device, dtype=x.dtype)
         kernel[:, :, kernel_size // 2, :] = 1.0 / kernel_size
@@ -266,7 +265,7 @@ class AttackLibrary:
 
     @staticmethod
     def hue_shift(x, shift=0.1):
-        """色调偏移 (仅 3 通道生效)"""
+        """Shift hue for three-channel RGB inputs."""
         if x.shape[1] != 3:
             return x
         B = x.shape[0]
@@ -281,14 +280,14 @@ class AttackLibrary:
 
     @staticmethod
     def chain(x, *fns):
-        """级联多个攻击"""
+        """Apply multiple attacks in sequence."""
         for fn in fns:
             x = fn(x)
         return x
 
 
 def get_seen_attacks():
-    """返回已见攻击配置 (与训练噪声池对齐)"""
+    """Return the seen-attack configurations aligned with the training noise pool."""
     atk = AttackLibrary
     return OrderedDict([
         # ("JPEG_Q10",          lambda x: atk.jpeg(x, quality=10)),
@@ -328,58 +327,57 @@ def get_seen_attacks():
 
 
 def get_unseen_attacks():
-    """
-    返回未见攻击配置 (训练时完全未出现) — 加强版
+    """Return the extended unseen-attack benchmark configurations.
 
-    目标: 避免天花板效应,让 Phase 1 vs Phase 2 的差异能显现出来。
-    策略: (1) 现有攻击加大参数  (2) 新增更强的攻击类型  (3) 级联攻击
+    Stronger filters, additional distortion types, and cascaded attacks help
+    avoid ceiling effects when comparing the base and Phase 2 networks.
     """
     atk = AttackLibrary
     return OrderedDict([
-        # ---- 线性滤波 (加大 kernel) ----
+        # ---- Linear filtering with larger kernels ----
         # ("MeanFilter_7",      lambda x: atk.mean_filter(x, kernel_size=7)),
         # ("MeanFilter_9",      lambda x: atk.mean_filter(x, kernel_size=9)),
         # ("MotionBlur_9",      lambda x: atk.motion_blur(x, kernel_size=9)),
         ("MotionBlur_15",     lambda x: atk.motion_blur(x, kernel_size=15)),
 
-        # ---- 锐化 (加大强度) ----
+        # ---- Stronger sharpening ----
         # ("Sharpen_1.5",       lambda x: atk.sharpen(x, strength=1.5)),
         ("Sharpen_2.0",       lambda x: atk.sharpen(x, strength=2.0)),
 
-        # ---- 亮度/对比度 (加大偏移) ----
+        # ---- Larger brightness and contrast changes ----
         # ("Brightness_-40",    lambda x: atk.brightness(x, delta=-40)),
         ("Brightness_+40",    lambda x: atk.brightness(x, delta=40)),
         # ("Contrast_0.5",      lambda x: atk.contrast(x, factor=0.5)),
         ("Contrast_1.6",      lambda x: atk.contrast(x, factor=1.6)),
 
-        # ---- 色调偏移 (新增) ----
+        # ---- Additional hue shift ----
         # ("HueShift_0.1",      lambda x: atk.hue_shift(x, shift=0.1)),
         # ("HueShift_0.2",      lambda x: atk.hue_shift(x, shift=0.2)),
 
-        # ---- 泊松噪声 (加大,lam 越小噪声越强) ----
+        # ---- Stronger Poisson noise: smaller lam produces more noise ----
         # ("Poisson_15",        lambda x: atk.poisson_noise(x, lam=15)),
         ("Poisson_8",         lambda x: atk.poisson_noise(x, lam=8)),
 
-        # ---- WebP 压缩 (加大压缩率) ----
+        # ---- Stronger WebP compression ----
         ("WebP_Q20",          lambda x: atk.webp(x, quality=20)),
         # ("WebP_Q10",          lambda x: atk.webp(x, quality=10)),
 
-        # ---- JPEG2000 (新增压缩类型) ----
+        # ---- Additional JPEG2000 compression ----
         # ("JPEG2000_Q30",      lambda x: atk.jpeg2000(x, quality=30)),
         # ("JPEG2000_Q15",      lambda x: atk.jpeg2000(x, quality=15)),
 
-        # ---- 缩放攻击 (加大,比例越小损失越多) ----
+        # ---- More aggressive resizing: smaller scale loses more information ----
         ("Resize_0.5x",       lambda x: atk.resize_attack(x, scale=0.5)),
         # ("Resize_0.35x",      lambda x: atk.resize_attack(x, scale=0.35)),
         # ("Resize_0.25x",      lambda x: atk.resize_attack(x, scale=0.25)),
 
-        # ---- 几何变换 (新增) ----
+        # ---- Additional geometric transformations ----
         ("Rotation_5deg",     lambda x: atk.rotation(x, angle=5.0)),
         # ("Rotation_10deg",    lambda x: atk.rotation(x, angle=10.0)),
         ("CenterCrop_0.8",    lambda x: atk.center_crop_resize(x, crop_ratio=0.8)),
         # ("CenterCrop_0.7",    lambda x: atk.center_crop_resize(x, crop_ratio=0.7)),
 
-        # ---- 级联攻击 (新增, 模拟真实 pipeline) ----
+        # ---- Cascaded attacks approximating image processing pipelines ----
         ("Resize_0.5+WebP_30", lambda x: atk.chain(
             x,
             lambda y: atk.resize_attack(y, scale=0.5),
@@ -399,7 +397,7 @@ def get_unseen_attacks():
 
 
 def compute_psnr_np(img1, img2):
-    """计算 PSNR"""
+    """Compute PSNR."""
     mse = np.mean((img1 - img2) ** 2)
     if mse == 0:
         return float('inf')
@@ -407,9 +405,9 @@ def compute_psnr_np(img1, img2):
 
 
 def compute_ssim_torch(img1, img2, window_size=11, sigma=1.5):
-    """计算 SSIM，输入为 NCHW、取值范围 [0, 1] 的 tensor。"""
+    """Compute SSIM for NCHW image tensors with values in [0, 1]."""
     if img1.shape != img2.shape:
-        raise ValueError(f"SSIM 输入尺寸不一致: {img1.shape} vs {img2.shape}")
+        raise ValueError(f"SSIM input shapes differ: {img1.shape} vs {img2.shape}")
 
     _, channel, _, _ = img1.shape
     coords = torch.arange(window_size, dtype=img1.dtype, device=img1.device)
@@ -440,7 +438,7 @@ def compute_ssim_torch(img1, img2, window_size=11, sigma=1.5):
 
 
 def print_results_table(results, quality, model_name="Model"):
-    """打印单模型结果表"""
+    """Print a single-model results table."""
     print(f"\n{'=' * 60}")
     print(f"  {model_name}")
     print(f"  Stego PSNR: {quality['psnr']:.2f} dB  |  SSIM: {quality['ssim']:.4f}")
@@ -457,7 +455,7 @@ def print_results_table(results, quality, model_name="Model"):
 
 def print_comparison_table(results1, quality1, results2, quality2,
                            name1="Phase1", name2="Phase2"):
-    """打印双模型对比表"""
+    """Print a comparison table for two models."""
     print(f"\n{'=' * 75}")
     print(f"  {name1} PSNR: {quality1['psnr']:.2f} dB, SSIM: {quality1['ssim']:.4f}  |  "
           f"{name2} PSNR: {quality2['psnr']:.2f} dB, SSIM: {quality2['ssim']:.4f}")

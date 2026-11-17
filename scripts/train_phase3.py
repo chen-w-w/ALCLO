@@ -1,26 +1,10 @@
-"""
-ALCLO Phase 3 训练脚本: Score Network 训练 (离线)
+"""ALCLO Phase 3: train a Score Network with the Phase 2 iIWN frozen.
 
-Phase 2 的 iIWN 参数完全冻结，本阶段只训练 ScoreNetwork。
-训练数据在线生成: 冻结的 iIWN 对训练图像做正向+噪声攻击+逆向，得到 I_rec。
-ScoreNetwork 学习从 I_rec 预测朝 I_cover 修正的方向。
-
-训练循环 (每个 batch):
-    ┌─────────────────────────────────────────────────┐
-    │ 1. 加载 cover images + 随机 watermark            │
-    │ 2. iIWN 正向: (cover, w) → (stego, z)           │
-    │ 3. 固定/混合噪声: stego → noised                 │
-    │ 4. iIWN 逆向: (noised, z_rand) → (I_rec, w_hat) │
-    │ 5. correction = ScoreNetwork(I_rec, sigma)       │
-    │ 6. I_pred = I_rec + correction                   │
-    │ 7. 用 cover 监督 I_pred                          │
-    └─────────────────────────────────────────────────┘
-
-用法:
-    python scripts/train_phase3.py \
-        --phase2_checkpoint checkpoints/phase2_R0_baseline/model_63.pth \
-        --dataset_path ../../DIV2K/train \
-        --val_dataset_path ../../DIV2K/val
+Generate training reconstructions online: embed random watermarks, apply
+fixed or hybrid distortions, and invert iIWN with random latent values.
+The Score Network predicts a correction toward the original cover image.
+Only Score Network parameters are trained in this phase. See README.md
+for paired checkpoint requirements and example commands.
 """
 
 import os
@@ -36,7 +20,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-# 项目路径
+# Project import path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from crmark.nets import Model
@@ -55,18 +39,18 @@ from watermarklab.noiselayers.noiselayerloader import DigitalDistortion
 warnings.filterwarnings("ignore")
 
 
-# ==================== 工具函数 / 噪声层 ====================
+# ==================== Helpers and distortion layers ====================
 
 
 def freeze_module(module):
-    """冻结模块参数并切到 eval 模式。"""
+    """Freeze all module parameters and switch to evaluation mode."""
     module.eval()
     for p in module.parameters():
         p.requires_grad_(False)
 
 
 def resolve_eps_max(args, phase2_dict):
-    """优先复用 Phase 2 守门后保存的 eps；没有则用保守默认值。"""
+    """Reuse the saved Phase 2 epsilon, falling back to a conservative default."""
     if args.eps_max is not None:
         return
     ckpt_eps = phase2_dict.get('current_eps_max', phase2_dict.get('eps', None))
@@ -74,14 +58,14 @@ def resolve_eps_max(args, phase2_dict):
 
 
 def prepare_runtime_args(args, phase2_dict):
-    """根据 Phase 2 checkpoint 补齐运行期参数。"""
+    """Complete runtime settings from the Phase 2 checkpoint."""
     resolve_eps_max(args, phase2_dict)
     if args.noise_mode != "hybrid":
         args.val_restore_noise_mode = "fixed"
 
 
 def current_adv_eps(args, now_epoch):
-    """Phase 3 对抗扰动强度；默认使用 Phase 2 最终 eps。"""
+    """Return Phase 3 attack strength, using the final Phase 2 epsilon by default."""
     if args.eps_schedule == "constant":
         return args.eps_max
     return get_eps_schedule(max(now_epoch - 1, 0), args.num_epoch,
@@ -89,7 +73,7 @@ def current_adv_eps(args, now_epoch):
 
 
 def scalarize_noise_dict(noise_dict):
-    """DigitalDistortion 初始化需要标量强度；多强度时取第一个占位。"""
+    """Use the first strength as a scalar placeholder when initializing DigitalDistortion."""
     return {
         key: (value[0] if isinstance(value, (list, tuple)) else value)
         for key, value in noise_dict.items()
@@ -97,7 +81,7 @@ def scalarize_noise_dict(noise_dict):
 
 
 class RandomStrengthDigitalDistortion(nn.Module):
-    """DigitalDistortion 包装器: 随机选择噪声类型和该类型下的强度。"""
+    """Wrap DigitalDistortion to sample a distortion type and one of its strengths."""
 
     def __init__(self, noise_dict, max_step=1):
         super().__init__()
@@ -124,9 +108,9 @@ class RandomStrengthDigitalDistortion(nn.Module):
 
 
 def build_attacker(args, phase2_dict):
-    """从 Phase 2 checkpoint 恢复并冻结 attacker。"""
+    """Restore the attacker from the Phase 2 checkpoint and freeze it."""
     if 'attacker_state_dict' not in phase2_dict:
-        raise KeyError("Phase 2 checkpoint 缺少 attacker_state_dict，无法启用 hybrid 噪声池。")
+        raise KeyError("Phase 2 checkpoint has no attacker_state_dict; hybrid noise cannot be enabled.")
 
     attacker = AdversarialAttacker(
         in_channels=args.channel_dim,
@@ -139,14 +123,14 @@ def build_attacker(args, phase2_dict):
 
 
 def build_noise_layers(args, phase2_dict):
-    """构造训练、restore 验证、z-opt 验证三套噪声入口。"""
+    """Build noise layers for training, reconstruction validation, and z-opt validation."""
     train_fixed = RandomStrengthDigitalDistortion(
         noise_dict=args.train_noise_dict, max_step=args.max_step)
     test_fixed = DigitalDistortion(
         noise_dict=args.test_noise_dict, max_step=args.max_step)
 
     if args.noise_mode != "hybrid":
-        print("使用固定 DigitalDistortion 噪声池。")
+        print("Using the fixed DigitalDistortion pool.")
         return train_fixed, test_fixed, test_fixed
 
     attacker = build_attacker(args, phase2_dict)
@@ -163,14 +147,14 @@ def build_noise_layers(args, phase2_dict):
             p_adv=args.p_adv,
         ).to(args.device)
 
-    print(f"Hybrid 噪声池已启用: p_adv={args.p_adv}, "
+    print(f"Hybrid noise enabled: p_adv={args.p_adv}, "
           f"eps=[{args.eps_min:.6f}, {args.eps_max:.6f}], "
           f"schedule={args.eps_schedule}")
     return train_layer, val_layer, test_fixed
 
 
 def apply_noise(noise_layer, stego_quant, cover, args, now_epoch):
-    """支持固定噪声池和 Phase 2 混合噪声池两种输入分布。"""
+    """Apply either the fixed distortion pool or the Phase 2 hybrid pool."""
     if isinstance(noise_layer, HybridNoiseLayer):
         eps = current_adv_eps(args, now_epoch)
         noised, is_adv = noise_layer(stego_quant, cover, now_epoch, eps)
@@ -192,9 +176,9 @@ def apply_noise(noise_layer, stego_quant, cover, args, now_epoch):
 
 
 def generate_reconstruction(model, noise_layer, cover, secret, args, now_epoch):
-    """用冻结的 iIWN 在线生成 I_rec，并返回对应 cover 作为监督目标。
+    """Generate a reconstruction with frozen iIWN and return its target cover.
 
-    流程: cover+w → iIWN正向 → stego量化 → 噪声池 → noised量化 → iIWN逆向 → I_rec
+    Embed, quantize, apply noise, quantize again, and invert with random z.
     """
     with torch.no_grad():
         stego, z = model.forward(cover, secret, True, False)
@@ -210,11 +194,11 @@ def generate_reconstruction(model, noise_layer, cover, secret, args, now_epoch):
     return I_rec.detach(), cover.detach(), noise_stats
 
 
-# ==================== 验证: z 优化效果 ====================
+# ==================== Validate latent optimization ====================
 
 
 def validate_z_optimization(model, score_net, noise_layer, val_loader, args):
-    """验证 z 优化的效果: 对比 random-z 和 optimized-z 的提取精度。"""
+    """Compare extraction accuracy using random z and optimized z."""
     z_optimizer = ZOptimizer(
         iiwn_model=model,
         score_network=score_net,
@@ -247,7 +231,7 @@ def validate_z_optimization(model, score_net, noise_layer, val_loader, args):
                     stego_quant, val_cover, intensity)
                 noised_quant = quantize_image(noised)
 
-            # 逐张处理 (z 优化是单张的)
+            # Process one image at a time for latent optimization.
             B = noised_quant.shape[0]
             for i in range(B):
                 noised_i = noised_quant[i:i + 1]
@@ -277,7 +261,7 @@ def validate_z_optimization(model, score_net, noise_layer, val_loader, args):
 
 
 def score_checkpoint_params(args):
-    """保存复现实验所需的 ScoreNet、噪声和 z-opt 参数。"""
+    """Record Score Network, distortion, and z-optimization settings for reproducibility."""
     keys = (
         'channel_dim', 'noise_mode', 'val_restore_noise_mode',
         'p_adv', 'eps_min', 'eps_max', 'eps_schedule',
@@ -297,30 +281,30 @@ def score_checkpoint_params(args):
     return params
 
 
-# ==================== 主训练函数 ====================
+# ==================== Training loop ====================
 
 
 def train(args):
     torch.manual_seed(args.seed)
 
-    print(f"\n加载 Phase 2 checkpoint: {args.phase2_checkpoint}")
+    print(f"\nLoading Phase 2 checkpoint: {args.phase2_checkpoint}")
     phase2_dict = torch.load(args.phase2_checkpoint, map_location="cpu", weights_only=False)
     prepare_runtime_args(args, phase2_dict)
 
-    # 打印参数
+    # Display the configuration.
     table = PrettyTable(["Argument", "Value"])
     for k, v in vars(args).items():
         table.add_row([k, v])
     print(table)
 
-    # ---- 日志和目录 ----
+    # ---- Logging and checkpoint directories ----
     log_path = os.path.join(args.logs_path, args.train_name)
     ckpt_dir = os.path.join(args.checkpoint_path, args.train_name)
     os.makedirs(log_path, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     writer = SummaryWriter(log_path)
 
-    # ---- 加载 Phase 2 iIWN (冻结) ----
+    # ---- Load and freeze the Phase 2 iIWN ----
     model = Model(
         img_size=args.im_size, channel_dim=args.channel_dim,
         bit_length=args.bit_length, k=args.k,
@@ -329,9 +313,9 @@ def train(args):
 
     model.load_state_dict(phase2_dict['model_state_dict'])
     freeze_module(model)
-    print("iIWN 已加载并冻结。")
+    print("iIWN loaded and frozen.")
 
-    # ---- 创建 Score Network ----
+    # ---- Create the Score Network ----
     score_net = ScoreNetwork(
         in_channels=args.channel_dim,
         base_channels=args.score_base_channels,
@@ -340,19 +324,19 @@ def train(args):
     ).to(args.device)
 
     score_params = sum(p.numel() for p in score_net.parameters())
-    print(f"Score Network 参数量: {score_params / 1e6:.2f}M")
+    print(f"Score Network parameters: {score_params / 1e6:.2f}M")
 
-    # ---- 噪声层 (用于在线生成训练数据) ----
+    # ---- Distortions for online training reconstruction generation ----
     train_noiselayer, val_restore_noiselayer, zopt_val_noiselayer = build_noise_layers(
         args, phase2_dict)
 
-    # ---- 优化器 ----
+    # ---- Optimizer ----
     optim = AdamW(score_net.parameters(), lr=args.score_lr, betas=(0.9, 0.999),
                   weight_decay=args.score_weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, T_max=args.num_epoch, eta_min=args.score_min_lr)
 
-    # ---- 数据加载 ----
+    # ---- Image datasets ----
     train_dataset = HideImage(args.dataset_path, args.im_size,
                               args.bit_length, args.channel_dim)
     val_dataset = HideImage(args.val_dataset_path, args.im_size,
@@ -362,7 +346,7 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
                             shuffle=False, drop_last=True, pin_memory=True)
 
-    # ---- 断点续训 ----
+    # ---- Checkpoint resume ----
     start_epoch = 0
     global_step = 0
     if args.continue_train:
@@ -375,9 +359,9 @@ def train(args):
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             start_epoch = ckpt['epoch']
             global_step = ckpt['global_step']
-            print(f"从 epoch {start_epoch} 继续训练")
+            print(f"Resuming from epoch {start_epoch}.")
 
-    # ---- 训练循环 ----
+    # ---- Epoch loop ----
     score_net.train()
 
     remaining = max(args.num_epoch - start_epoch, 0)
@@ -392,7 +376,7 @@ def train(args):
             cover = cover.to(args.device)
             secret = secret.to(args.device)
 
-            # 在线生成 I_rec，并用 cover 监督恢复方向
+            # Generate I_rec online and supervise its correction with the cover.
             I_rec, cover_target, noise_stats = generate_reconstruction(
                 model, train_noiselayer, cover, secret, args, now_epoch)
 
@@ -405,12 +389,12 @@ def train(args):
             optim.zero_grad()
             loss.backward()
 
-            # 梯度裁剪
+            # Clip gradients.
             torch.nn.utils.clip_grad_norm_(score_net.parameters(), max_norm=1.0)
 
             optim.step()
 
-            # 记录
+            # Record metrics.
             global_step += 1
             loss_list.append(loss.item())
             adv_ratio_list.append(noise_stats['noise_adv_ratio'])
@@ -432,9 +416,9 @@ def train(args):
         writer.add_scalar("train/epoch_loss", np.mean(loss_list), now_epoch)
         writer.add_scalar("train/lr", scheduler.get_last_lr()[0], now_epoch)
 
-        # ---- 验证和保存 ----
+        # ---- Validate and save ----
         if (now_epoch - 1) % args.val_save_epoch == 0:
-            print(f"\n验证 epoch {now_epoch}...")
+            print(f"\nValidating epoch {now_epoch}...")
             score_net.eval()
 
             # 1. Supervised restoration validation loss
@@ -452,11 +436,11 @@ def train(args):
                 val_losses.append(val_loss.item())
             avg_val_loss = np.mean(val_losses)
             writer.add_scalar("val/restore_loss", avg_val_loss, now_epoch)
-            print(f"  验证 restore loss: {avg_val_loss:.4f}")
+            print(f"  Validation reconstruction loss: {avg_val_loss:.4f}")
 
-            # 2. z 优化效果评估 (每 val_z_opt_epoch 做一次，比较耗时)
+            # 2. Run the more expensive z-opt validation every val_z_opt_epoch epochs.
             if (now_epoch - 1) % args.val_z_opt_epoch == 0:
-                print("  评估 z 优化效果...")
+                print("  Evaluating latent optimization...")
                 z_opt_results = validate_z_optimization(
                     model, score_net, zopt_val_noiselayer, val_loader, args)
 
@@ -477,7 +461,7 @@ def train(args):
 
             score_net.train()
 
-            # 保存 checkpoint
+            # Save the checkpoint.
             save_dict = {
                 'score_net_state_dict': score_net.state_dict(),
                 'optim_state_dict': optim.state_dict(),
@@ -489,17 +473,17 @@ def train(args):
             }
             save_path = os.path.join(ckpt_dir, f"score_model_{now_epoch}.pth")
             torch.save(save_dict, save_path)
-            print(f"  checkpoint 已保存: {save_path}\n")
+            print(f"  Checkpoint saved: {save_path}\n")
 
     writer.close()
-    print("Phase 3 训练完成。")
+    print("Phase 3 training complete.")
 
 
-# ==================== 参数配置 ====================
+# ==================== Argument configuration ====================
 
 
 def main():
-    # 与 Phase 1/2 保持一致的固定训练噪声池。
+    # Use a fixed training distortion pool consistent with Phases 1 and 2.
     train_noise_dict = {
         "Jpeg": 30, "GaussianBlur": 1.5, "GaussianNoise": 0.15,
         "SaltPepperNoise": 0.15, "MedianFilter": 7, "Dropout": 0.3,
@@ -510,40 +494,40 @@ def main():
     }
 
     parser = argparse.ArgumentParser(
-        description="ALCLO Phase 3: Score Network 训练")
+        description="ALCLO Phase 3: Score Network training")
 
-    # 设备
+    # Device settings.
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
 
-    # 数据
+    # Dataset settings.
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--dataset_path", type=str, default=r"../../DIV2K/train")
     parser.add_argument("--val_dataset_path", type=str, default=r"../../DIV2K/val")
     parser.add_argument("--im_size", type=int, default=256)
     parser.add_argument("--channel_dim", type=int, default=3)
 
-    # 噪声
+    # Distortion settings.
     parser.add_argument("--train_noise_dict", type=dict, default=train_noise_dict)
     parser.add_argument("--test_noise_dict", type=dict, default=test_noise_dict)
     parser.add_argument("--max_step", type=int, default=1)
     parser.add_argument("--noise_mode", choices=["hybrid", "fixed"], default="hybrid",
-                        help="Phase 3 训练噪声源: hybrid 复用 Phase 2 attacker + 固定噪声池")
+                        help="Training noise source: hybrid combines the Phase 2 attacker and fixed distortions")
     parser.add_argument("--val_restore_noise_mode", choices=["hybrid", "fixed"],
                         default="hybrid",
-                        help="restore loss 验证使用的噪声源; z-opt 验证始终逐项使用固定攻击")
+                        help="Reconstruction validation noise source; z-opt validation always uses individual fixed attacks")
     parser.add_argument("--p_adv", type=float, default=0.35,
-                        help="hybrid 噪声池中使用 Phase 2 attacker 的样本比例")
+                        help="Fraction of hybrid samples using the Phase 2 attacker")
     parser.add_argument("--eps_min", type=float, default=2.0 / 255)
     parser.add_argument("--eps_max", type=float, default=None,
-                        help="hybrid attacker 最大扰动; 默认读取 ckpt，否则用 Phase 2 R0 的 12/255")
+                        help="Maximum attack perturbation; inherit from checkpoint, otherwise use 12/255")
     parser.add_argument("--eps_schedule", choices=["constant", "linear"],
                         default="constant",
-                        help="constant 使用 Phase 2 最终 eps; linear 从 eps_min 线性升到 eps_max")
+                        help="constant uses final Phase 2 epsilon; linear ramps from eps_min to eps_max")
     parser.add_argument("--atk_hidden_channels", type=int, default=64)
     parser.add_argument("--atk_num_blocks", type=int, default=4)
 
-    # iIWN 模型参数 (必须与 Phase 2 一致)
+    # iIWN architecture must match the Phase 2 checkpoint.
     parser.add_argument("--bit_length", type=int, default=64)
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--min_size", type=int, default=16)
@@ -551,42 +535,42 @@ def main():
 
     # Phase 2 checkpoint
     parser.add_argument("--phase2_checkpoint", type=str, required=True,
-                        help="Phase 2 训练好的 checkpoint 路径")
+                        help="Trained Phase 2 checkpoint")
 
-    # Score Network 架构
+    # Score Network architecture.
     parser.add_argument("--score_base_channels", type=int, default=64)
     parser.add_argument("--score_channel_mults", type=int, nargs='+',
                         default=[1, 2, 4, 4],
-                        help="Score U-Net 各层通道倍数")
+                        help="Channel multipliers for the Score U-Net stages")
     parser.add_argument("--score_embed_dim", type=int, default=256)
 
-    # ScoreNetwork 训练参数
+    # Score Network optimization settings.
     parser.add_argument("--score_lr", type=float, default=1e-4)
     parser.add_argument("--score_min_lr", type=float, default=2e-6)
     parser.add_argument("--score_weight_decay", type=float, default=1e-5)
 
-    # z 优化验证参数
+    # Latent optimization validation settings.
     parser.add_argument("--z_opt_steps", type=int, default=30,
-                        help="z 优化步数")
+                        help="Number of latent optimization steps")
     parser.add_argument("--z_opt_lr", type=float, default=0.03,
-                        help="z 优化学习率")
+                        help="Latent optimization learning rate")
     parser.add_argument("--z_opt_sigma", type=float, default=0.01,
-                        help="z 优化时 score network 的 σ")
+                        help="Score Network sigma during latent optimization")
     parser.add_argument("--z_opt_lambda_prior", type=float, default=0.5)
     parser.add_argument("--z_opt_lambda_ent", type=float, default=0.3)
     parser.add_argument("--val_num_images", type=int, default=32,
-                        help="z 优化验证时使用的图像数量")
+                        help="Number of validation images for latent optimization")
 
-    # 训练参数
+    # Training settings.
     parser.add_argument("--train_name", type=str, default="phase3_hybrid_multinoise")
     parser.add_argument("--num_epoch", type=int, default=80)
     parser.add_argument("--seed", type=int, default=99)
     parser.add_argument("--val_save_epoch", type=int, default=1,
-                        help="每隔多少 epoch 验证和保存")
+                        help="Validation and checkpoint interval in epochs")
     parser.add_argument("--val_z_opt_epoch", type=int, default=4,
-                        help="每隔多少 epoch 评估 z 优化效果 (耗时较长)")
+                        help="Interval in epochs for the more expensive latent optimization validation")
 
-    # 路径
+    # Output paths.
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/")
     parser.add_argument("--logs_path", type=str, default="logs")
     parser.add_argument("--continue_train", type=bool, default=False)

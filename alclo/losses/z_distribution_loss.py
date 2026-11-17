@@ -1,25 +1,15 @@
-"""
-z 分布正则化损失 (z Distribution Regularization Loss)
+"""Latent distribution regularization for ALCLO.
 
-设计思路:
-    DRRW 原始的 Lz = MSE(z, 0) 只约束 z 的均值接近零，
-    但不关心 z 的方差和形状。这导致:
-    1. z 的分布偏离高斯 → 算术编码的概率模型不匹配 → 辅助比特流变长
-    2. z 的分布不规则 → 推理时 z 优化的搜索空间无结构 → 优化效果差
+Three terms encourage z to approach a standard normal distribution:
+    (E[z])**2: Push the mean toward zero.
+    (std(z) - 1)**2: Push the standard deviation toward one.
+    abs(skewness(z)): Encourage symmetry.
 
-    ALCLO 的 Lz_dist 用三项联合约束 z 逼近 N(0,1):
-    - (E[z])^2:       约束均值 → 0 (注意不是 MSE(z,0)=E[z^2], 见下方说明)
-    - (std(z)-1)^2:   约束标准差 → 1
-    - |skewness(z)|:  约束偏度 → 0 (对称性)
-
-    为什么均值项不能写成 torch.mean(z**2):
-        torch.mean(z**2) = E[z^2] = Var(z) + (E[z])^2
-        它同时在压 "均值→0" 和 "方差→0", 会和 loss_std 正交冲突.
-        正确的纯均值约束应该是 (torch.mean(z))**2 — 先求均值再平方.
-
-    统计量在整个 batch 的所有元素上计算 (全局 scalar 统计量), 对应的假设是
-    "z 所有元素整体服从 N(0,1)", 这与 arithmetic coding 对 z 做熵编码时假设的
-    全局分布一致.
+The mean term must square the mean, rather than average squared values:
+E[z**2] = Var(z) + E[z]**2 would also shrink the variance and conflict with
+the standard-deviation objective. Statistics are computed over all elements
+of the batch, matching the global distribution used for arithmetic coding.
+Regularizing the distribution also structures the latent optimization space.
 """
 
 import torch
@@ -27,15 +17,12 @@ import torch.nn as nn
 
 
 class ZDistributionLoss(nn.Module):
-    """
-    z 分布正则化损失。
+    """Regularize z toward N(0, 1) using mean, standard deviation, and skewness.
 
-    将 z 推向标准正态分布 N(0, 1)。
-
-    参数:
-        lambda_mean: 均值约束权重，默认 1e-3
-        lambda_std: 方差约束权重，默认 1e-2
-        lambda_skew: 偏度约束权重，默认 1e-3
+    Args:
+        lambda_mean: Mean penalty weight; defaults to 1e-3.
+        lambda_std: Standard-deviation penalty weight; defaults to 1e-2.
+        lambda_skew: Skewness penalty weight; defaults to 1e-3.
     """
 
     def __init__(self, lambda_mean=1e-3, lambda_std=1e-2, lambda_skew=1e-3):
@@ -45,28 +32,25 @@ class ZDistributionLoss(nn.Module):
         self.lambda_skew = lambda_skew
 
     def forward(self, z):
-        """
-        参数:
-            z: 潜变量 (B, bit_length)
+        """Return a scalar distribution loss and latent statistics for logging.
 
-        返回:
-            loss: 标量损失
-            stats: 字典，包含 z 的统计量 (用于日志)
+        Args:
+            z: Latent tensor, typically shaped (B, bit_length).
         """
-        # 注意 loss_mean 与 loss_std 必须解耦, 否则会互相打架:
-        # 若写成 torch.mean(z**2) = E[z^2] = Var(z) + E[z]^2, 则该项同时在压
-        # 均值到 0 和方差到 0, 会与 loss_std (推 std → 1) 产生直接冲突,
-        # 导致 z 分布迁移过程反复震荡无法收敛. 因此这里用 (E[z])^2 做"纯均值约束".
+        # Decouple the mean and standard-deviation objectives:
+        # mean(z**2) = E[z**2] = Var(z) + E[z]**2 would shrink both
+        # the mean and variance toward zero, conflicting with the target std of one.
+        # Use E[z]**2 to constrain only the mean and avoid oscillatory distribution updates.
 
-        # 均值约束: E[z] → 0, 即 (E[z])^2 → 0, 不影响方差
+        # Mean constraint: E[z] -> 0 without directly shrinking the variance.
         z_mean = torch.mean(z)
         loss_mean = z_mean ** 2
 
-        # 标准差约束: std(z) → 1 (在整个 batch 的所有元素上计算)
+        # Standard-deviation constraint: std(z) -> 1 across all elements in the batch.
         z_std = torch.std(z)
         loss_std = (z_std - 1.0) ** 2
 
-        # 偏度约束: skewness(z) → 0
+        # Skewness constraint: skewness(z) -> 0.
         z_centered = z - z_mean
         skewness = torch.mean(z_centered ** 3) / (z_std ** 3 + 1e-8)
         loss_skew = torch.abs(skewness)

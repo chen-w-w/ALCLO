@@ -1,48 +1,34 @@
-# ==================== 导入依赖库 ====================
+# ==================== Imports ====================
 import os
 import re
 import string
 
 import torch
-import lpips      # 感知损失库
-import bchlib     # BCH 纠错码库
-import kornia     # 计算机视觉库
-import hashlib    # 哈希算法库
+import lpips      # Perceptual loss library.
+import bchlib     # BCH error-correcting code library.
+import kornia     # Computer vision library.
+import hashlib    # Hashing library.
 import numpy as np
 from torch import nn, Tensor
 
 
-# ==================== 损失函数类 ====================
+# ==================== Loss functions ====================
 class LPIPSLoss(nn.Module):
-    """
-    LPIPS (Learned Perceptual Image Patch Similarity) 感知损失。
-
-    使用预训练的 AlexNet 提取特征，计算输入图像和目标图像在特征空间的距离，
-    比传统的 MSE 更符合人眼感知。
-    """
+    """LPIPS perceptual loss using pretrained AlexNet features."""
 
     def __init__(self):
         super().__init__()
-        # 使用 AlexNet 作为特征提取器
+        # Use AlexNet as the feature extractor.
         self.lpips = lpips.LPIPS(net="alex", verbose=False)
 
     def __call__(self, input_image, target_image):
-        """
-        计算 LPIPS 损失。
-
-        参数:
-            input_image: 输入图像，范围 [0, 1]。
-            target_image: 目标图像，范围 [0, 1]。
-
-        返回:
-            LPIPS 损失值。
-        """
-        # 如果是灰度图，复制为三通道
+        """Compute LPIPS loss for input and target images in [0, 1]."""
+        # Repeat grayscale inputs across three channels.
         if input_image.shape[1] == 1:
             input_image = input_image.repeat(1, 3, 1, 1)
             target_image = target_image.repeat(1, 3, 1, 1)
 
-        # 归一化到 [-1, 1] 范围（LPIPS 要求）
+        # Normalize to [-1, 1], as required by LPIPS.
         normalized_input = input_image.clamp(0, 1.) * 2 - 1
         normalized_encoded = target_image.clamp(0, 1.) * 2 - 1
 
@@ -50,145 +36,76 @@ class LPIPSLoss(nn.Module):
         return lpips_loss
 
 
-# ==================== 随机舍入类 ====================
+# ==================== Stochastic rounding ====================
 class StochasticRound:
-    """
-    随机舍入（Stochastic Rounding）操作类。
+    """Stochastic rounding with a straight-through gradient path.
 
-    在神经网络量化中，随机舍入可以在训练时提供梯度信号，
-    在推理时提供确定性的硬舍入结果。
-
-    原理：
-    - 软舍入（训练）：添加随机噪声，保持梯度流动
-    - 硬舍入（推理）：直接四舍五入到最近整数
+    Soft rounding adds noise during training; hard rounding produces
+    deterministic quantized values for inference.
     """
 
     def __init__(self, scale=1 / 255.):
-        """
-        初始化随机舍入操作。
-
-        参数:
-            scale: 缩放因子，默认 1/255（对应8位图像精度）。
-        """
+        """Initialize the rounding scale; 1/255 corresponds to 8-bit image precision."""
         super().__init__()
         self.scale = scale
 
     def __call__(self, x, hard_round):
-        """
-        执行随机舍入。
-
-        参数:
-            x: 输入张量。
-            hard_round: 是否使用硬舍入（True=推理模式，False=训练模式）。
-
-        返回:
-            舍入后的张量。
-        """
-        # 按缩放因子缩放输入
+        """Round tensor x; hard_round selects deterministic inference or noisy training."""
+        # Rescale the input.
         scale_x = x / self.scale
 
-        # 执行舍入操作（使用 detach 保持梯度）
+        # Use detach to preserve a straight-through gradient through rounding.
         round_out = scale_x + (torch.round(scale_x) - scale_x).detach()
 
-        # 添加随机噪声（用于训练时的随机舍入）
+        # Add random noise for stochastic rounding during training.
         out = round_out + torch.rand_like(x) - 0.5
 
-        # 根据模式返回结果
+        # Select the result for the requested mode.
         if hard_round:
-            return round_out * self.scale  # 硬舍入：确定性结果
-        return out * self.scale  # 软舍入：带噪声，保持梯度
+            return round_out * self.scale  # Hard rounding produces deterministic values.
+        return out * self.scale  # Soft rounding adds noise while preserving gradients.
 
 
-# ==================== 溢出惩罚损失类 ====================
+# ==================== Pixel-range penalty ====================
 class PenalityLoss(nn.Module):
-    """
-    溢出像素惩罚损失。
-
-    用于惩罚超出有效范围 [0, max_value] 的像素值，
-    防止神经网络生成溢出（>255）或下溢（<0）的像素。
-    """
+    """Penalize pixel values outside the valid interval [0, max_value]."""
 
     def __init__(self, max_value=1.):
-        """
-        初始化惩罚损失。
-
-        参数:
-            max_value: 最大允许像素值，默认 1（归一化范围）。
-        """
+        """Configure the maximum permitted pixel value for the range penalty."""
         super().__init__()
         self.max_value = max_value
         self.MSE = nn.MSELoss(reduce=True)
 
     def __call__(self, input_tensor):
-        """
-        计算溢出惩罚损失。
-
-        参数:
-            input_tensor: 输入张量。
-
-        返回:
-            惩罚损失值。
-        """
-        # 惩罚小于0的像素（下溢）
+        """Return the range-violation penalty for an input tensor."""
+        # Penalize underflow below zero.
         loss_0 = self.MSE(torch.relu(-input_tensor), torch.zeros_like(input_tensor))
 
-        # 惩罚大于max_value的像素（溢出）
+        # Penalize overflow above max_value.
         loss_255 = self.MSE(torch.relu(input_tensor - self.max_value), torch.zeros_like(input_tensor))
 
-        # 总损失为两者之和
+        # Sum both penalties.
         loss = loss_0 + loss_255
         return loss
 
 
-# ==================== 图像处理工具函数 ====================
+# ==================== Image processing utilities ====================
 def normalize(input_image):
-    """
-    将输入图像张量归一化到 [0, 1] 范围。
-
-    使用 min-max 归一化：
-    normalized = (x - min) / (max - min)
-
-    参数:
-        input_image: 输入图像张量。
-
-    返回:
-        归一化后的图像张量。
-    """
+    """Apply min-max normalization to map an image tensor into [0, 1]."""
     min_vals = input_image.amin(dim=(1, 2, 3), keepdim=True)
     max_vals = input_image.amax(dim=(1, 2, 3), keepdim=True)
-    normalized_img = (input_image - min_vals) / (max_vals - min_vals + 1e-5)  # 防止除零
+    normalized_img = (input_image - min_vals) / (max_vals - min_vals + 1e-5)  # Avoid division by zero.
     return normalized_img
 
 
 def extract_accuracy(ext_secret, secret, max_value=1.):
-    """
-    计算提取的秘密图像的准确率。
-
-    参数:
-        ext_secret: 提取的秘密图像。
-        secret: 真实的秘密图像（ground truth）。
-        max_value: 最大像素值，默认 1。
-
-    返回:
-        准确率值（0-1之间）。
-    """
+    """Return extraction accuracy between predicted and ground-truth secrets."""
     acc = 1.0 - (torch.abs(torch.round(ext_secret.clamp(0., max_value)) - secret).mean())
     return acc.item()
 
 
 def overflow_num(stego, mode, min_value=0., max_value=1.):
-    """
-    计算隐写图像中溢出像素的数量。
-
-    参数:
-        stego: 隐写图像张量。
-        mode: 溢出模式（0=下溢，255=溢出）。
-        min_value: 最小允许像素值，默认 0。
-        max_value: 最大允许像素值，默认 1。
-
-    返回:
-        平均溢出像素数量。
-    """
+    """Return the mean number of underflow or overflow pixels in a stego batch."""
     assert mode in [0, 255]
     if mode == 0:
         overflow_pixel_n = torch.sum(StochasticRound()(stego, True) < min_value, dim=(1, 2, 3)).float().mean()
@@ -198,18 +115,8 @@ def overflow_num(stego, mode, min_value=0., max_value=1.):
 
 
 def compute_psnr(input_image, target_image, max_value=1.):
-    """
-    计算两幅图像之间的 PSNR（峰值信噪比）。
-
-    参数:
-        input_image: 输入图像张量。
-        target_image: 目标图像张量。
-        max_value: 最大像素值，默认 1。
-
-    返回:
-        平均 PSNR 值（dB）。
-    """
-    # 应用随机舍入并限制到 [0, 1] 范围
+    """Return mean PSNR in dB between image tensors with the given maximum value."""
+    # Apply stochastic rounding and clamp to [0, 1].
     input_image = StochasticRound()(input_image.clamp(0., 1.), True)
     target_image = StochasticRound()(target_image.clamp(0., 1.), True)
 
@@ -218,55 +125,28 @@ def compute_psnr(input_image, target_image, max_value=1.):
 
 
 def quantize_image(input_image):
-    """
-    使用随机舍入对输入图像进行量化。
-
-    参数:
-        input_image: 输入图像张量，值范围 [0, 1]。
-
-    返回:
-        量化后的图像张量。
-    """
-    # 应用随机舍入（硬舍入模式）
+    """Quantize an image tensor in [0, 1] using hard stochastic rounding."""
+    # Apply deterministic hard rounding.
     input_image = StochasticRound()(input_image.clamp(0., 1.), True)
     return input_image
 
 
 def quantize_residual_image(input_image, target_image):
-    """
-    量化残差图像（输入图像与目标图像的差值）。
-
-    用于可视化嵌入造成的像素变化。
-
-    参数:
-        input_image: 输入图像张量。
-        target_image: 目标图像张量。
-
-    返回:
-        量化后的残差图像。
-    """
-    # 计算残差（差值），放大10倍以便可视化
+    """Quantize an amplified residual image for visualizing embedding changes."""
+    # Amplify the image residual tenfold for visualization.
     shift = (input_image - target_image) * 10.
-    # 归一化并应用随机舍入
+    # Normalize and apply stochastic rounding.
     input_image = StochasticRound()(normalize(shift), True)
     return input_image
 
 
-# ==================== 模型管理工具函数 ====================
+# ==================== Checkpoint utilities ====================
 def find_latest_model(model_dir):
-    """
-    在给定目录中查找最新的模型文件（epoch 号最大的 .pth 文件）。
-
-    参数:
-        model_dir: 包含模型文件的目录路径。
-
-    返回:
-        最新模型文件的路径，如果没有找到则返回 None。
-    """
+    """Find model_<epoch>.pth with the largest epoch, or return None if absent."""
     max_epoch = -1
     latest_model_path = None
 
-    # 正则表达式匹配 "model_{epoch}.pth" 格式
+    # Match filenames following the model_<epoch>.pth pattern.
     pattern = re.compile(r"model_(\d+)\.pth")
 
     for file_name in os.listdir(model_dir):
@@ -280,131 +160,82 @@ def find_latest_model(model_dir):
     return latest_model_path
 
 
-# ==================== 哈希工具函数 ====================
+# ==================== Hash utilities ====================
 def sha256_of_image_array(img_array):
-    """
-    计算 NumPy 图像数组的 SHA-256 哈希值。
-
-    用于图像完整性验证，检测图像是否被篡改。
-
-    参数:
-        img_array: 输入图像数组。
-
-    返回:
-        64字符的十六进制 SHA-256 哈希字符串。
-    """
-    # 将图像数组转换为字节序列
+    """Return the 64-character hexadecimal SHA-256 hash of a NumPy image array."""
+    # Serialize the image array as bytes.
     img_bytes = img_array.tobytes()
-    # 计算 SHA-256 哈希并返回十六进制表示
+    # Return its SHA-256 hash as a hexadecimal string.
     sha256_hash = hashlib.sha256(img_bytes).hexdigest()
     return sha256_hash
 
 
 def sha256_to_bitstream(sha256_str):
-    """
-    将 64 字符的十六进制 SHA-256 字符串转换为 256 位比特流。
-
-    每个十六进制字符代表 4 位（16 = 2^4），所以 64 个字符 = 256 位。
-
-    参数:
-        sha256_str: 64 字符的十六进制 SHA-256 哈希字符串。
-
-    返回:
-        256 个二进制值（0 或 1）的列表。
-    """
+    """Convert a 64-character hexadecimal SHA-256 hash into 256 big-endian bits."""
     bits = np.zeros(256, dtype=np.uint8)
 
-    # 遍历 SHA-256 字符串的每个字符
+    # Process each hexadecimal hash character.
     for i, hex_char in enumerate(sha256_str):
-        # 将十六进制字符转换为整数（0-15）
+        # Convert the character to an integer in [0, 15].
         val = int(hex_char, 16)
-        # 将 4 位值转换为二进制，按大端序存储
+        # Write the four-bit value in big-endian order.
         for j in range(4):
             bits[i * 4 + (3 - j)] = (val >> j) & 1
 
     return bits.tolist()
 
 
-# ==================== BCH 纠错码类 ====================
+# ==================== BCH error correction ====================
 class BCH:
-    """
-    BCH (Bose-Chaudhuri-Hocquenghem) 纠错码封装类。
-
-    BCH 是一种循环纠错码，可以纠正多个比特错误。
-    用于增强水印的鲁棒性，即使部分比特被破坏也能正确恢复消息。
-    """
+    """BCH error-correcting code wrapper for robust watermark messages."""
 
     def __init__(self, BCH_POLYNOMIAL_=501, BCH_BITS_=12):
-        """
-        初始化 BCH 编码器。
-
-        参数:
-            BCH_POLYNOMIAL_: BCH 多项式，默认 501。
-            BCH_BITS_: 纠错能力（可纠正的比特数），默认 12。
-        """
+        """Initialize BCH with the requested polynomial and error-correction capacity."""
         self.bch = bchlib.BCH(BCH_BITS_, BCH_POLYNOMIAL_)
 
     def Encode(self, data_: str):
-        """
-        编码字符串为带纠错码的比特流。
-
-        参数:
-            data_: 要编码的字符串。
-
-        返回:
-            编码后的比特列表（数据 + 纠错码）。
-        """
-        # 将字符串转换为字节数组
+        """Encode a UTF-8 string into message bits followed by BCH parity bits."""
+        # Encode the string as UTF-8 bytes.
         data_ = bytearray(data_, 'utf-8')
-        # 计算纠错码（ECC）
+        # Compute error-correction parity bytes.
         ecc = self.bch.encode(data_)
-        # 合并数据和纠错码
+        # Append parity bytes to the message.
         packet = data_ + ecc
-        # 转换为二进制字符串
+        # Convert the packet to a binary string.
         packet_binary = ''.join(format(x, '08b') for x in packet)
-        # 转换为比特列表
+        # Convert the string to a bit list.
         secret_ = [int(x) for x in packet_binary]
         return secret_
 
     def Decode(self, secret_: list):
-        """
-        解码比特流并纠正错误。
-
-        参数:
-            secret_: 接收到的比特列表（可能包含错误）。
-
-        返回:
-            元组 (success, decoded_data):
-            - success: 是否成功解码（True/False）
-            - decoded_data: 解码后的字符串
-        """
-        # 将比特列表转换为二进制字符串
+        """Correct bit errors and return (success, decoded_data)."""
+        # Convert the bit list to a binary string.
         packet_binary = "".join([str(int(bit)) for bit in secret_])
-        # 转换为字节
+        # Convert the string to bytes.
         packet = bytes(int(packet_binary[i: i + 8], 2) for i in range(0, len(packet_binary), 8))
         packet = bytearray(packet)
 
-        # 分离数据和纠错码
+        # Separate message and parity bytes.
         data_, ecc = packet[:-self.bch.ecc_bytes], packet[-self.bch.ecc_bytes:]
 
-        # 尝试解码并纠正错误
+        # Attempt decoding and error correction.
         bit_flips = self.bch.decode(data_, ecc)
 
         if bit_flips != -1:
-            # 解码成功，纠正错误
+            # Correct the errors after successful decoding.
             self.bch.correct(data_, ecc)
             return True, data_.decode('utf-8')
         else:
-            # 解码失败（错误太多无法纠正）
+            # Decoding failed because the errors could not be corrected.
             return False, data_.decode('utf-8')
 
 
-# ==================== 主程序入口 ====================
+# ==================== Standalone entry point ====================
 if __name__ == "__main__":
     import random
 
     def flip_n_bits(bits: list, n: int) -> list:
-        """随机翻转 n 个比特（模拟传输错误）。"""
+        """Randomly flip n bits to simulate transmission errors."""
         flipped = bits.copy()
         bit_indices = random.sample(range(len(bits)), n)
         for idx in bit_indices:
@@ -412,29 +243,29 @@ if __name__ == "__main__":
         return flipped
 
     def generate_random_string(n: int) -> str:
-        """生成随机字符串。"""
+        """Generate a random string."""
         characters = string.ascii_letters + string.digits
         return ''.join(random.choices(characters, k=n))
 
-    # 测试 BCH 编解码
+    # Exercise BCH encoding and decoding.
     bch_codec = BCH()
     original_data = generate_random_string(20)
-    print("原始数据:", original_data)
+    print("Original message:", original_data)
 
-    # 编码
+    # Encode the message.
     secret = bch_codec.Encode(original_data)
-    print(f"编码后比特数: {len(secret)}")
+    print(f"Encoded bit count: {len(secret)}")
 
-    # 模拟错误（翻转 n 个比特）
-    n = 0  # 设置错误比特数
+    # Simulate errors by flipping n bits.
+    n = 0  # Number of bits to flip.
     noisy_secret = flip_n_bits(secret, n)
-    print(f"添加 {n} 个错误比特")
+    print(f"Introducing {n} bit errors")
 
-    # 解码
+    # Decode the message.
     isdecode, decoded_data = bch_codec.Decode(noisy_secret)
 
     if isdecode:
-        print("解码数据:", decoded_data)
-        print("成功!" if decoded_data == original_data else "不匹配!")
+        print("Decoded message:", decoded_data)
+        print("Success!" if decoded_data == original_data else "Mismatch!")
     else:
-        print("解码失败（错误太多无法纠正）")
+        print("Decoding failed: too many errors to correct")

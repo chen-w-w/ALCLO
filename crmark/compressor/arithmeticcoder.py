@@ -1,40 +1,16 @@
 #!/usr/bin/env python3
-"""
-算术编码器 - 累积和与Fenwick树实现
-=====================================
+"""Arithmetic coding with Fenwick-tree cumulative frequency tables.
 
-本模块实现算术编码（Arithmetic Coding），用于高效压缩数据。
+FenwickTree supports prefix sums and frequency updates in O(log n).
+CumulativeSum maps symbols to cumulative intervals. ArithmeticEncoder
+encodes and decodes symbol streams using integer interval arithmetic, and
+CustomArithmeticEncoder provides array-oriented serialization.
 
-核心组件：
-- FenwickTree: 树状数组，支持O(log n)的累积和操作
-- CumulativeSum: 基于Fenwick树的累积频率表
-- ArithmeticEncoder: 算术编码器/解码器
-- CustomArithmeticEncoder: 针对NumPy数组优化的编码器
-
-算术编码原理：
-- 将整个消息编码为一个[0,1)区间内的浮点数
-- 高频符号使用较大的子区间，低频符号使用较小的子区间
-- 相比霍夫曼编码，可以达到分数比特的编码效率
-
-自适应模型：
-在自适应模型中，我们不使用固定的频率，而是：
-1. 初始时每个符号的频率设为1
-2. 编码过程中动态更新频率
-3. 解码时同步更新，保持编解码器状态一致
-
-示例：
->>> frequencies = {'a': 4, 'b': 1, 'c': 3}
->>> cumsum = CumulativeSum(frequencies)
->>> cumsum.get_low_high('a')
-(0, 4)
->>> cumsum.get_low_high('b')
-(4, 5)
-
-使用Fenwick树可以将累积和操作从O(n)优化到O(log n)，
-在符号数量较大时性能提升明显。
+Adaptive models initialize each symbol count to one and update matching
+encoder and decoder frequency tables after each symbol.
 """
 
-# ==================== 导入依赖库 ====================
+# ==================== Imports ====================
 import copy
 import random
 import itertools
@@ -43,43 +19,24 @@ import numpy as np
 from numpy import ndarray
 
 
-# ==================== Fenwick树（树状数组）====================
+# ==================== Fenwick tree ====================
 class FenwickTree:
-    """
-    Fenwick树（Binary Indexed Tree），用于高效维护前缀和。
+    """Fenwick tree supporting O(log n) prefix sums and updates.
 
-    核心操作：
-    - prefix_sum(i): 查询[0, i)的前缀和，O(log n)
-    - add(i, k): 在位置i增加k，O(log n)
-    - range_sum(l, r): 查询[l, r)区间和，O(log n)
+    prefix_sum(i) covers [0, i), range_sum(l, r) covers [l, r), and add(i, k)
+    increments an element. Each tree node stores a range determined by its
+    least significant set bit.
 
-    原理：
-    利用二进制表示，每个节点存储一段区间的和。
-    例如：tree[12] = tree[1100b] 存储区间 [1100b - 100b, 1100b) = [8, 12) 的和
-
-    参考实现：https://github.com/dstein64/fenwick
-
-    示例：
-    >>> frequencies = [1, 0, 2, 1, 1, 3, 0, 4]
-    >>> ft = FenwickTree(frequencies)
-    >>> ft.prefix_sum(3)  # 1 + 0 + 2 = 3
-    3
-    >>> ft[2]  # 获取索引2的值
-    2
+    Reference: https://github.com/dstein64/fenwick
     """
 
     def __init__(self, frequencies):
-        """
-        初始化Fenwick树。
-
-        参数:
-            frequencies: 初始频率列表。
-        """
+        """Initialize the Fenwick tree from the supplied frequency list."""
         self._v = list(frequencies)
 
-        # O(n)初始化：利用子节点更新父节点
+        # Initialize in O(n) by propagating child sums to their parents.
         for idx in range(1, len(self) + 1):
-            parent_idx = idx + (idx & -idx)  # 父节点索引
+            parent_idx = idx + (idx & -idx)  # Parent index.
             if parent_idx <= len(self):
                 self._v[parent_idx - 1] += self._v[idx - 1]
 
@@ -87,38 +44,17 @@ class FenwickTree:
         return len(self._v)
 
     def prefix_sum(self, stop):
-        """
-        计算[0, stop)区间的前缀和（不包含stop）。
-
-        算法：利用lowbit不断减去最低位的1
-        例如：prefix_sum(13) = prefix_sum(1101b)
-        = tree[1101b] + tree[1100b] + tree[1000b]
-
-        参数:
-            stop: 结束位置（不包含）。
-
-        返回:
-            前缀和。
-        """
+        """Return the prefix sum over [0, stop), excluding stop."""
         if stop <= 0 or stop > len(self):
             raise IndexError("index out of range")
         _sum = 0
         while stop > 0:
             _sum += self._v[stop - 1]
-            stop &= stop - 1  # 减去lowbit
+            stop &= stop - 1  # Subtract the least significant set bit.
         return _sum
 
     def range_sum(self, start, stop):
-        """
-        计算[start, stop)区间的和。
-
-        参数:
-            start: 起始位置（包含）。
-            stop: 结束位置（不包含）。
-
-        返回:
-            区间和。
-        """
+        """Return the sum over the half-open interval [start, stop)."""
         if start < 0 or start >= len(self):
             raise IndexError("index out of range")
         if stop <= start or stop > len(self):
@@ -129,15 +65,7 @@ class FenwickTree:
         return result
 
     def __getitem__(self, idx):
-        """
-        获取索引idx处的值（不是累积和）。
-
-        参数:
-            idx: 索引（支持负数索引）。
-
-        返回:
-            该位置的值。
-        """
+        """Return the element at idx, supporting negative indices."""
         if isinstance(idx, int):
             idx = idx % len(self)
             return self.range_sum(idx, idx + 1)
@@ -145,12 +73,7 @@ class FenwickTree:
             raise IndexError(f"Indexing only works with integers, got {idx}")
 
     def frequencies(self):
-        """
-        获取所有频率值，O(n)。
-
-        返回:
-            频率列表。
-        """
+        """Return all element frequencies in O(n) time."""
         _frequencies = [0] * len(self)
         for idx in range(1, len(self) + 1):
             _frequencies[idx - 1] += self._v[idx - 1]
@@ -160,38 +83,25 @@ class FenwickTree:
         return _frequencies
 
     def add(self, idx, k):
-        """
-        在索引idx处增加k。
-
-        参数:
-            idx: 索引（0-based）。
-            k: 要增加的值。
-        """
+        """Add k to the element at zero-based index idx."""
         if idx < 0 or idx >= len(self):
             raise IndexError("index out of range")
         idx += 1
         while idx <= len(self):
             self._v[idx - 1] += k
-            idx += idx & -idx  # 加上lowbit，更新所有相关父节点
+            idx += idx & -idx  # Add the least significant set bit to update each relevant parent.
 
     def __setitem__(self, idx, value):
-        """直接设置值（通过add实现）。"""
+        """Set an element by applying the corresponding increment."""
         self.add(idx, value - self[idx])
 
     def bisect_left(self, value):
+        """Return the smallest index whose cumulative sum reaches value.
+
+        This locates the symbol containing an arithmetic decoder value. Return
+        len(self) when no index satisfies the search condition.
         """
-        二分查找：返回最小的索引i，使得前缀和 >= value。
-
-        用于根据累积值查找对应的符号。
-        例如：在算术解码时，根据编码值查找对应的符号。
-
-        参数:
-            value: 目标累积值。
-
-        返回:
-            满足条件的最小索引，如果不存在则返回len(self)。
-        """
-        # 参考：https://stackoverflow.com/questions/34699616/fenwick-trees-to-determine-which-interval-a-point-falls-in
+        # Reference: https://stackoverflow.com/questions/34699616/fenwick-trees-to-determine-which-interval-a-point-falls-in
         j = 2 ** len(self)
 
         i = -1
@@ -206,67 +116,45 @@ class FenwickTree:
         return isinstance(other, FenwickTree) and self._v == other._v
 
 
-# ==================== 累积和类 ====================
+# ==================== Cumulative frequency tables ====================
 class NaiveCumulativeSum:
-    """
-    简单累积和实现（O(n)操作）。
-
-    用于对比和测试，实际使用CumulativeSum（基于Fenwick树）。
-    """
+    """Naive O(n) cumulative frequency table for comparison with CumulativeSum."""
 
     def __init__(self, frequencies, update=True):
-        """
-        初始化累积和。
-
-        参数:
-            frequencies: 符号频率字典。
-            update: 是否允许更新频率。
-        """
+        """Initialize a frequency dictionary, optionally enabling adaptive updates."""
         self.frequencies = dict(frequencies)
         self.ranges = dict(self.ranges_from_frequencies(self.frequencies))
         self.update = update
 
     def get_low_high(self, symbol):
-        """获取符号的累积范围 (low, high)。"""
+        """Return the cumulative (low, high) bounds for a symbol."""
         return self.ranges[symbol]
 
     def add_count(self, symbol, value):
-        """增加符号的计数（O(n)）。"""
+        """Increment a symbol frequency using the naive O(n) implementation."""
         if self.update:
             self.frequencies[symbol] += value
             self.ranges = dict(self.ranges_from_frequencies(self.frequencies))
 
     def total_count(self):
-        """获取总频率。"""
+        """Return the total symbol frequency."""
         return sum(self.frequencies.values())
 
     def reset(self):
-        """重置所有频率为1。"""
+        """Reset every symbol frequency to one."""
         self.frequencies = {frequency: 1 for frequency in self.frequencies}
         self.ranges = dict(self.ranges_from_frequencies(self.frequencies))
 
     @staticmethod
     def ranges_from_frequencies(frequencies):
-        """
-        从频率字典构建范围字典。
-
-        例如：{'a': 5, 'b': 3, 'c': 2} -> {'a': (0, 5), 'b': (5, 8), 'c': (8, 10)}
-        """
+        """Convert symbol frequencies to contiguous cumulative (low, high) ranges."""
         cumsum = 0
         for symbol, frequency in sorted(frequencies.items()):
             yield (symbol, (cumsum, cumsum + frequency))
             cumsum += frequency
 
     def search_ranges(self, value):
-        """
-        根据累积值查找对应的符号。
-
-        参数:
-            value: 累积值。
-
-        返回:
-            对应的符号。
-        """
+        """Return the symbol containing the supplied cumulative value."""
         for symbol, (low, high) in self.ranges.items():
             if low <= value < high:
                 return symbol
@@ -274,38 +162,18 @@ class NaiveCumulativeSum:
 
 
 class CumulativeSum:
-    """
-    基于Fenwick树的快速累积和实现。
-
-    用于算术编码中的符号频率管理，支持O(log n)的查询和更新。
-    """
+    """Fenwick-tree cumulative frequencies with O(log n) queries and updates."""
 
     def __init__(self, frequencies, update=True):
-        """
-        初始化累积和。
-
-        参数:
-            frequencies: 符号频率字典。
-            update: 是否允许更新频率（自适应模型）。
-        """
+        """Initialize a Fenwick-tree frequency table with optional adaptive updates."""
         symbols = sorted(frequencies.keys())
-        self.idx_to_symbol = dict(enumerate(symbols))  # 索引到符号的映射
-        self.symbol_to_idx = {s: i for (i, s) in self.idx_to_symbol.items()}  # 符号到索引的映射
+        self.idx_to_symbol = dict(enumerate(symbols))  # Map indices to symbols.
+        self.symbol_to_idx = {s: i for (i, s) in self.idx_to_symbol.items()}  # Map symbols to indices.
         self.fenwick_tree = FenwickTree([frequencies[s] for s in symbols])
         self.update = update
 
     def get_low_high(self, symbol):
-        """
-        获取符号的累积范围 [low, high)。
-
-        在算术编码中，这个范围决定了符号对应的子区间。
-
-        参数:
-            symbol: 符号。
-
-        返回:
-            (low, high) 元组。
-        """
+        """Return the half-open cumulative interval [low, high) for a symbol."""
         idx = self.symbol_to_idx[symbol]
         if idx == 0:
             return (0, self.fenwick_tree[idx])
@@ -314,151 +182,77 @@ class CumulativeSum:
         return (sum_upto, sum_upto + self.fenwick_tree[idx])
 
     def add_count(self, symbol, value):
-        """
-        增加符号的计数。
-
-        用于自适应模型：编码/解码过程中动态更新频率。
-
-        参数:
-            symbol: 符号。
-            value: 增加的值。
-        """
+        """Increment a symbol frequency during adaptive encoding or decoding."""
         if self.update:
             idx = self.symbol_to_idx[symbol]
             self.fenwick_tree.add(idx, value)
 
     def total_count(self):
-        """获取总频率。"""
+        """Return the total symbol frequency."""
         return self.fenwick_tree.prefix_sum(len(self.fenwick_tree))
 
     def reset(self):
-        """重置所有频率为1。"""
+        """Reset every symbol frequency to one."""
         self.fenwick_tree = FenwickTree([1] * len(self.fenwick_tree))
 
     def search_ranges(self, value):
-        """
-        根据累积值查找符号。
-
-        在算术解码时使用：根据编码值确定对应的符号。
-
-        参数:
-            value: 累积值。
-
-        返回:
-            对应的符号。
-        """
+        """Locate the symbol associated with a cumulative decoder value."""
         idx = self.fenwick_tree.bisect_left(value)
         return self.idx_to_symbol[idx]
 
 
-# ==================== 算术编码器 ====================
-"""
-算术编码器实现说明
-===================
-
-算术编码是一种熵编码方法，将整个消息编码为一个[0,1)区间内的浮点数。
-
-核心思想：
-- 根据符号频率将区间划分为子区间
-- 高频符号获得较大的子区间
-- 低频符号获得较小的子区间
-- 相比霍夫曼编码，可以达到分数比特的编码效率
-
-基本使用示例：
->>> message = ['A', 'B', 'B', 'B', '<EOM>']
->>> frequencies = {'A': 1, 'B': 3, '<EOM>': 1}
->>> encoder = ArithmeticEncoder(frequencies=frequencies, bits=6)
->>> bits = list(encoder.encode(message))
->>> list(encoder.decode(bits))
-['A', 'B', 'B', 'B', '<EOM>']
-
-压缩效果示例：
-- 符号'e'的频率是'q'的136倍
-- 10000个符号压缩后仅需676比特
-- 平均每个符号仅需0.0676比特
-"""
+# ==================== Arithmetic coder ====================
+"""Arithmetic coding represents a message as an interval within [0, 1). Symbol frequencies partition the interval: frequent symbols receive larger subintervals. Integer interval renormalization supports fractional-bit coding efficiency. Construct ArithmeticEncoder with a frequency model and precision, encode a sequence ending with EOM, and decode the resulting bitstream with the same model."""
 
 
 class BitQueue:
-    """
-    比特队列，用于处理算术编码中的"比特跟随"情况。
+    """Track deferred complement bits during arithmetic coding.
 
-    在算术编码中，当区间跨越中点时，需要延迟输出比特，
-    直到区间收敛到某一侧。此时需要记录需要跟随的相反比特数量。
-
-    示例：
-    >>> bitqueue = BitQueue()
-    >>> bitqueue += 3  # 有3个比特需要跟随
-    >>> list(bitqueue.bit_plus_follow(0))  # 输出0，然后跟随3个1
-    [0, 1, 1, 1]
+    When an interval straddles the midpoint, defer the output until a leading
+    bit is known, then emit its complement for every deferred bit.
     """
 
-    bits_to_follow = 0  # 需要跟随的比特计数器
+    bits_to_follow = 0  # Number of deferred complement bits.
 
     def __add__(self, bits):
-        """增加需要跟随的比特数量。"""
+        """Increase the number of deferred complement bits."""
         self.bits_to_follow += bits
         return self
 
     def bit_plus_follow(self, bit):
-        """
-        输出比特，然后输出所有需要跟随的相反比特。
-
-        参数:
-            bit: 当前比特（0或1）。
-
-        生成:
-            当前比特，后跟bits_to_follow个相反比特。
-        """
+        """Yield bit followed by the complement for each deferred output bit."""
         yield bit
         yield from itertools.repeat(int(not bit), times=self.bits_to_follow)
-        self.bits_to_follow = 0  # 重置计数器
+        self.bits_to_follow = 0  # Reset the counter.
 
 
 class ArithmeticEncoder:
-    """
-    算术编码器/解码器实现。
+    """Integer arithmetic encoder and decoder.
 
-    参考论文：
-    - Witten, Neal, Cleary (1987). Arithmetic coding for data compression.
-    - https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html
+    The coding interval [0, TOP_VALUE] represents [0, 1). Symbol frequencies
+    progressively narrow it; renormalization emits resolved bits and expands
+    the remaining interval.
 
-    核心概念：
-    - 使用整数区间 [0, TOP_VALUE] 代替浮点数 [0, 1)
-    - 通过不断缩小区间来编码符号
-    - 当区间足够小时，输出确定的比特并扩展区间
-
-    区间划分：
-    - [0, FIRST_QUARTER): 下四分之一
-    - [FIRST_QUARTER, HALF): 中下半区
-    - [HALF, THIRD_QUARTER): 中上半区
-    - [THIRD_QUARTER, TOP_VALUE]: 上四分之一
+    References:
+        Witten, Neal, and Cleary (1987), Arithmetic coding for data compression.
+        https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html
     """
 
     def __init__(self, frequencies: list, *, bits=16, verbose=0, EOM="<EOM>"):
-        """
-        初始化算术编码器。
+        """Initialize the arithmetic coder.
 
-        参数:
-            frequencies: 符号频率字典或符号列表。
-                        如果是字典，使用固定频率；
-                        如果是列表，使用自适应模型（初始频率为1）。
-            bits: 编码器使用的比特数，决定精度（默认16）。
-            verbose: 调试信息级别（0=无，>0=详细）。
-            EOM: 消息结束标记符号。
-
-        示例:
-            >>> encoder = ArithmeticEncoder(frequencies={'A': 1, 'B': 3}, bits=6)
-            >>> bits = list(encoder.encode(['A', 'B', '<EOM>']))
-            >>> list(encoder.decode(bits))
-            ['A', 'B', '<EOM>']
+        Args:
+            frequencies: A fixed frequency dictionary or an adaptive symbol list.
+            bits: Integer interval precision; defaults to 16.
+            verbose: Diagnostic verbosity; zero disables diagnostic output.
+            EOM: End-of-message symbol.
         """
         self.EOM = EOM
         self.frequencies = frequencies.copy()
         self.bits = bits
         self.verbose = verbose
 
-        # 从频率构建累积和
+        # Build cumulative ranges from frequencies.
         if isinstance(frequencies, dict):
             assert all(isinstance(freq, int) for freq in self.frequencies.values())
             assert self.EOM in self.frequencies.keys()
@@ -468,20 +262,20 @@ class ArithmeticEncoder:
             frequencies = {symbol: 1 for symbol in self.frequencies}
             self.cumsum = CumulativeSum(frequencies, update=True)
 
-        # 定义区间边界（以4比特为例）：
-        self.TOP_VALUE = (1 << self.bits) - 1      # 0b1111 = 15，最大值
-        self.FIRST_QUARTER = (self.TOP_VALUE >> 2) + 1  # 0b0100 = 4，四分之一处
-        self.HALF = self.FIRST_QUARTER * 2         # 0b1000 = 8，中点
-        self.THIRD_QUARTER = self.FIRST_QUARTER * 3     # 0b1100 = 12，四分之三处
+        # Interval boundaries, illustrated with 4-bit precision:
+        self.TOP_VALUE = (1 << self.bits) - 1      # 0b1111 = 15, the maximum value.
+        self.FIRST_QUARTER = (self.TOP_VALUE >> 2) + 1  # 0b0100 = 4, the first quarter.
+        self.HALF = self.FIRST_QUARTER * 2         # 0b1000 = 8, the midpoint.
+        self.THIRD_QUARTER = self.FIRST_QUARTER * 3     # 0b1100 = 12, the third quarter.
 
-        # 检查精度是否足够（论文第533页公式）
+        # Check that the interval precision is sufficient (formula on page 533 of the paper).
         if self.cumsum.total_count() > int((self.TOP_VALUE + 1) / 4) + 1:
-            msg = "精度不足，无法编码低概率符号。"
-            msg += "\n请增加 `bits` 参数的值。"
+            msg = "Insufficient precision to encode low-probability symbols."
+            msg += "\nIncrease the bits parameter."
             raise Exception(msg)
 
         if self.verbose > 0:
-            print("初始化参数:")
+            print("Initialization parameters:")
             print(f" bits          = {self.bits}")
             print(f" TOP_VALUE     = 0b{self.TOP_VALUE:0{self.bits}b} ({self.TOP_VALUE})")
             print(f" THIRD_QUARTER = 0b{self.THIRD_QUARTER:0{self.bits}b} ({self.THIRD_QUARTER})")
@@ -489,7 +283,7 @@ class ArithmeticEncoder:
             print(f" FIRST_QUARTER = 0b{self.FIRST_QUARTER:0{self.bits}b} ({self.FIRST_QUARTER})")
 
     def _print_state(self, low, high, value=None, *, prefix=" ", end="\n"):
-        """打印编码器状态（用于调试）。"""
+        """Print the coder state for debugging."""
         range_ = high - low + 1
         print(prefix + f"High value: 0b{high:0{self.bits}b} ({high})")
         if value is not None:
@@ -498,45 +292,37 @@ class ArithmeticEncoder:
         print(prefix + f"Range: [{low}, {high + 1}) Width: {range_}", end=end)
 
     def encode(self, iterable):
-        """
-        编码符号序列，生成比特流。
+        """Yield encoded bits for an iterable of symbols.
 
-        算术编码核心算法：
-        1. 根据符号概率缩小编码区间 [low, high]
-        2. 当区间落入某一区域时，输出确定的比特
-        3. 扩展区间，继续编码
-
-        参数:
-            iterable: 符号序列。
-
-        生成:
-            比特（0或1）。
+        Narrow the coding interval using symbol frequencies, emit resolved leading
+        bits, and renormalize the interval. Encoder and decoder arithmetic must use
+        the same operation order.
         """
         if self.verbose:
-            print("------------------------ 编码中 ------------------------")
+            print("------------------------ Encoding ------------------------")
 
-        # 复制累积和对象，防止编解码器共享状态
+        # Copy cumulative frequencies so encoder and decoder states remain independent.
         cumsum = copy.deepcopy(self.cumsum)
 
-        bit_queue = BitQueue()  # 比特跟随队列
+        bit_queue = BitQueue()  # Queue of deferred complement bits.
 
-        # 初始化编码区间 [low, high]
+        # Initialize the coding interval [low, high].
         low = 0
         high = self.TOP_VALUE
 
-        # 遍历每个符号
+        # Process each symbol.
         for i, symbol in enumerate(iterable, 1):
             if self.verbose > 0:
-                print(f"\n处理第 {i} 个符号: {repr(symbol)}")
+                print(f"\nProcessing symbol {i}: {repr(symbol)}")
                 print("-" * 32)
 
-            # 当前区间宽度
+            # Current interval width.
             range_ = high - low + 1
 
-            # 算法不变量检查
+            # Check algorithm invariants.
             if range_ < cumsum.total_count():
-                msg = "精度不足，无法编码低概率符号。"
-                msg += "\n请增加 `bits` 参数的值。"
+                msg = "Insufficient precision to encode low-probability symbols."
+                msg += "\nIncrease the bits parameter."
                 raise Exception(msg)
             assert 0 <= low <= high <= self.TOP_VALUE
             assert low < self.HALF <= high
@@ -545,160 +331,151 @@ class ArithmeticEncoder:
             if self.verbose > 0:
                 self._print_state(low, high, prefix="")
 
-            # 获取符号的累积频率范围
+            # Get the cumulative frequency range for this symbol.
             symbol_low, symbol_high = cumsum.get_low_high(symbol)
 
-            # 根据符号概率缩小区间
-            # 注意：运算顺序必须与解码器完全一致
+            # Narrow the interval according to the symbol probability.
+            # The operation order must exactly match the decoder.
             total_count = cumsum.total_count()
             high = low + int(range_ * symbol_high / total_count) - 1
             low = low + int(range_ * symbol_low / total_count)
 
             if self.verbose > 0:
                 prob = (symbol_high - symbol_low) / total_count
-                print(f"\n缩小区间（符号 '{symbol}' 概率: {prob:.4f}）:")
+                print(f"\nNarrowed interval (symbol '{symbol}', probability {prob:.4f}):")
                 self._print_state(low, high, prefix="", end="\n\n")
 
-            # 处理区间收敛的三种情况：
-            # (1) 区间完全在下半区 [0, HALF) - 首位都是0
-            # (2) 区间完全在上半区 [HALF, TOP] - 首位都是1
-            # (3) 区间跨越中点 [FIRST_QUARTER, THIRD_QUARTER) - 首位相反
+            # Handle the three interval-renormalization cases:
+            # (1) Entirely in [0, HALF): all values have leading bit zero.
+            # (2) Entirely in [HALF, TOP]: all values have leading bit one.
+            # (3) Straddling the midpoint within [FIRST_QUARTER, THIRD_QUARTER).
             while True:
-                # 情况1：区间在下半区
+                # Case 1: the interval lies in the lower half.
                 if high < self.HALF:
                     if self.verbose > 0:
-                        print(" 区间在下半区 - 首位都是0")
+                        print(" Interval in the lower half: leading bit zero")
                         self._print_state(low, high, prefix="   ")
-                    # 输出0，然后跟随之前积累的相反比特
+                    # Emit zero followed by the deferred complement bits.
                     yield from bit_queue.bit_plus_follow(bit=0)
 
-                # 情况2：区间在上半区
+                # Case 2: the interval lies in the upper half.
                 elif low >= self.HALF:
                     if self.verbose > 0:
-                        print(" 区间在上半区 - 首位都是1")
+                        print(" Interval in the upper half: leading bit one")
                         self._print_state(low, high, prefix="   ")
-                    # 输出1，然后跟随之前积累的相反比特
+                    # Emit one followed by the deferred complement bits.
                     yield from bit_queue.bit_plus_follow(bit=1)
-                    # 去掉首位1，将区间移到下半区
+                    # Remove the leading one and shift the interval into the lower half.
                     low -= self.HALF
                     high -= self.HALF
 
-                # 情况3：区间跨越中点
+                # Case 3: the interval straddles the midpoint.
                 elif low >= self.FIRST_QUARTER and high < self.THIRD_QUARTER:
                     if self.verbose > 0:
-                        print(" 区间在中区 - 首位相反")
+                        print(" Interval straddles the midpoint: leading bits differ")
                         self._print_state(low, high, prefix="   ")
-                    # 此时 low 以01开头，high 以10开头
-                    # 去掉次高位，延迟输出（记录到跟随队列）
+                    # Here low starts with 01 and high starts with 10.
+                    # Remove the second most significant bit and defer its output.
                     low -= self.FIRST_QUARTER
                     high -= self.FIRST_QUARTER
-                    bit_queue += 1  # 增加需要跟随的比特数
+                    bit_queue += 1  # Increment the deferred-bit count.
                 else:
-                    break  # 区间不够小，继续编码
+                    break  # The interval is not narrow enough; continue encoding.
 
-                # 扩展区间（左移一位，low补0，high补1）
+                # Expand by shifting left, appending zero to low and one to high.
                 low = 2 * low
                 high = 2 * high + 1
                 if self.verbose > 0:
-                    print(" 扩展区间后:")
+                    print(" After interval expansion:")
                     self._print_state(low, high, prefix="   ")
 
-            # 自适应模型：更新符号频率
+            # Update symbol frequencies in the adaptive model.
             cumsum.add_count(symbol, 1)
 
-        # 检查最后一个符号是否是结束标记
+        # Verify that the last symbol is the end-of-message marker.
         if symbol != self.EOM:
-            raise ValueError(f"最后一个符号必须是 {repr(self.EOM)}，实际是 {repr(symbol)}")
+            raise ValueError(f"The final symbol must be {repr(self.EOM)}; got {repr(symbol)}")
 
-        # 结束编码：输出最终的比特
+        # Finish encoding by emitting the final bits.
         assert low < self.HALF
         bit_queue += 1
         yield from bit_queue.bit_plus_follow(int(low >= self.FIRST_QUARTER))
 
     def decode(self, iterable):
-        """
-        解码比特流，生成符号序列。
+        """Yield decoded symbols from an iterable of bits.
 
-        解码是编码的逆过程：
-        1. 根据当前值在区间中的位置确定符号
-        2. 按照编码时的方式缩小区间
-        3. 读取新的比特，扩展区间
-
-        参数:
-            iterable: 比特序列。
-
-        生成:
-            解码后的符号。
+        Locate each symbol using the current interval value, narrow the interval,
+        and read new bits while renormalizing in sync with the encoder.
         """
         if self.verbose:
-            print("------------------------ 解码中 ------------------------")
+            print("------------------------ Decoding ------------------------")
 
-        cumsum = copy.deepcopy(self.cumsum)  # 复制累积和
+        cumsum = copy.deepcopy(self.cumsum)  # Copy cumulative frequencies.
 
-        # 初始化区间和当前值
+        # Initialize the interval and current value.
         low = 0
         value = 0
         high = self.TOP_VALUE
 
-        # 读取前 `self.bits` 个比特作为初始值
+        # Read the first self.bits bits as the initial decoder value.
         iterable = enumerate(itertools.chain(iter(iterable), itertools.repeat(0)), 1)
         first_bits = itertools.islice(iterable, self.bits)
         for i, input_bit in first_bits:
             value = (value << 1) + input_bit
 
         if self.verbose:
-            print(f"读取初始 {i} 个比特: 0b{value:0{self.bits}b}")
+            print(f"Read the initial {i} bits: 0b{value:0{self.bits}b}")
 
-        # 主循环
+        # Main decoding loop.
         while True:
             if self.verbose:
-                print("当前状态:")
+                print("Current state:")
                 self._print_state(low, high, value, prefix=" ", end="\n")
 
-            # 计算当前值在区间中的相对位置
+            # Compute the current value's relative location in the interval.
             range_ = high - low + 1
             total_count = cumsum.total_count()
             scaled_value = ((value - low + 1) * total_count - 1) / range_
 
-            # 根据累积值查找对应的符号
+            # Find the symbol containing this cumulative value.
             symbol = cumsum.search_ranges(scaled_value)
             yield symbol
 
-            # 按照编码时的方式缩小区间
+            # Narrow the interval using the same arithmetic as the encoder.
             symbol_low, symbol_high = cumsum.get_low_high(symbol)
             total_count = cumsum.total_count()
             high = low + int(range_ * symbol_high / total_count) - 1
             low = low + int(range_ * symbol_low / total_count)
 
-            # 自适应模型：更新频率
+            # Update adaptive model frequencies.
             cumsum.add_count(symbol, 1)
 
             if self.verbose:
-                print(f"输出符号 '{symbol}' 后:")
+                print(f"After emitting symbol '{symbol}':")
                 self._print_state(low, high, value, prefix=" ", end="\n\n")
 
-            # 如果是结束标记，停止解码
+            # Stop at the end-of-message marker.
             if symbol == self.EOM:
                 break
 
-            # 处理区间收敛（与编码器同步）
+            # Renormalize in sync with the encoder.
             while True:
                 if high < self.HALF:
-                    # 区间在下半区
+                    # The interval lies in the lower half.
                     if self.verbose > 0:
-                        print(" 区间在下半区")
+                        print(" Interval in the lower half")
                     pass
                 elif low >= self.HALF:
-                    # 区间在上半区
+                    # The interval lies in the upper half.
                     if self.verbose > 0:
-                        print(" 区间在上半区")
+                        print(" Interval in the upper half")
                     value -= self.HALF
                     low -= self.HALF
                     high -= self.HALF
                 elif low >= self.FIRST_QUARTER and high < self.THIRD_QUARTER:
-                    # 区间跨越中点
+                    # The interval straddles the midpoint.
                     if self.verbose > 0:
-                        print(" 区间在中区")
+                        print(" Interval straddles the midpoint")
                     value -= self.FIRST_QUARTER
                     low -= self.FIRST_QUARTER
                     high -= self.FIRST_QUARTER
@@ -708,7 +485,7 @@ class ArithmeticEncoder:
                 if self.verbose > 0:
                     self._print_state(low, high, value, prefix="   ", end="\n")
 
-                # 扩展区间并读取新比特
+                # Expand the interval and read another bit.
                 low = 2 * low
                 high = 2 * high + 1
                 i, input_bit = next(iterable, 1)
@@ -716,131 +493,70 @@ class ArithmeticEncoder:
                 assert low <= value <= high
 
                 if self.verbose > 0:
-                    print(f"  读取比特 {i}: {input_bit}")
+                    print(f"  Read bit {i}: {input_bit}")
                     self._print_state(low, high, value, prefix="   ", end="\n\n")
 
 
-# ==================== 自定义算术编码器（针对NumPy数组）====================
+# ==================== Array-oriented arithmetic coder ====================
 class CustomArithmeticEncoder:
-    """
-    针对NumPy数组优化的算术编码器。
-
-    用于压缩RDH产生的预测误差等整数数据。
-    支持将数组元素作为符号进行算术编码。
-    """
+    """Array-oriented arithmetic coding for integer data and prediction errors."""
 
     def __init__(self, level_bits_len: int = 10, freq_bits_len: int = 10):
-        """
-        初始化编码器。
-
-        参数:
-            level_bits_len: 整数编码的比特长度。
-            freq_bits_len: 频率编码的比特长度。
-        """
-        self.buffer_bits = 30  # 算术编码器使用的比特数
+        """Configure the integer header width and signed data value width in bits."""
+        self.buffer_bits = 30  # Arithmetic coder precision in bits.
         self.freq_bits_len = freq_bits_len
         self.level_bits_len = level_bits_len
 
     def ndarray2strlist(self, data: ndarray) -> list:
-        """
-        将NumPy数组转换为字符串列表。
-
-        参数:
-            data: 输入数组。
-
-        返回:
-            字符串列表。
-        """
+        """Flatten a NumPy array and convert its values to strings."""
         data_list = data.flatten().tolist()
         data_str_list = [str(data_item) for data_item in data_list]
         return data_str_list
 
     def strlist2ndarray(self, data_str_list: list) -> list:
-        """
-        将字符串列表转换为整数列表。
-
-        参数:
-            data_str_list: 字符串列表。
-
-        返回:
-            整数列表。
-        """
+        """Convert a list of numeric strings to a list of integers."""
         data_list = [int(data_str_item) for data_str_item in data_str_list]
         return data_list
 
     def datastr2bits(self, data_str_list):
-        """
-        将字符串列表编码为固定长度的二进制比特流。
-
-        支持有符号整数（使用补码表示）。
-
-        参数:
-            data_str_list: 字符串列表。
-
-        返回:
-            比特列表（0和1）。
-        """
+        """Encode numeric strings as fixed-width bits using two's complement."""
         encoded_bits = []
         for item in data_str_list:
             num = int(item)
             if num < 0:
-                num = (1 << self.freq_bits_len) + num  # 负数转补码
-            binary_representation = bin(num)[2:]  # 转为二进制字符串
-            padded_binary = binary_representation.zfill(self.freq_bits_len)  # 零填充
+                num = (1 << self.freq_bits_len) + num  # Convert negative values to two's complement.
+            binary_representation = bin(num)[2:]  # Convert to a binary string.
+            padded_binary = binary_representation.zfill(self.freq_bits_len)  # Pad with leading zeros.
             if len(padded_binary) > self.freq_bits_len:
-                raise ValueError(f"值 {num} 无法用 {self.freq_bits_len} 比特表示。")
+                raise ValueError(f"Value {num} cannot be represented with {self.freq_bits_len} bits.")
             encoded_bits.extend(int(bit) for bit in padded_binary)
         return encoded_bits
 
     def bits2datastr(self, encoded_bits):
-        """
-        将比特流解码回字符串列表。
-
-        参数:
-            encoded_bits: 比特列表。
-
-        返回:
-            字符串列表。
-        """
+        """Decode fixed-width signed bits into numeric strings."""
         decoded_data = []
         for i in range(0, len(encoded_bits), self.freq_bits_len):
             bit_str = ''.join(map(str, encoded_bits[i:i + self.freq_bits_len]))
             num = int(bit_str, 2)
             if num >= (1 << (self.freq_bits_len - 1)):
-                num -= (1 << self.freq_bits_len)  # 补码转回有符号数
+                num -= (1 << self.freq_bits_len)  # Convert two's complement back to a signed value.
             decoded_data.append(str(num))
         return decoded_data
 
     def integer2bits(self, integer: int):
-        """
-        将整数编码为固定长度的比特列表。
-
-        参数:
-            integer: 要编码的整数。
-
-        返回:
-            比特列表。
-        """
+        """Encode an integer as a fixed-width bit list."""
         if integer < 0:
             integer = (1 << self.level_bits_len) + integer
         if integer >= (1 << self.level_bits_len):
-            raise ValueError(f"值 {integer} 无法用 {self.level_bits_len} 比特表示。")
+            raise ValueError(f"Value {integer} cannot be represented with {self.level_bits_len} bits.")
         binary_representation = bin(integer)[2:]
         padded_binary = binary_representation.zfill(self.level_bits_len)
         return [int(bit) for bit in padded_binary]
 
     def bits2integer(self, bits: list):
-        """
-        将比特列表解码为整数。
-
-        参数:
-            bits: 比特列表。
-
-        返回:
-            解码后的整数。
-        """
+        """Decode a bit list into an integer."""
         if len(bits) != self.level_bits_len:
-            raise ValueError(f"比特列表长度必须是 {self.level_bits_len}。")
+            raise ValueError(f"The bit list must contain {self.level_bits_len} bits.")
         bit_str = ''.join(str(bit) for bit in bits)
         num = int(bit_str, 2)
         if num >= (1 << (self.level_bits_len - 1)):
@@ -848,20 +564,11 @@ class CustomArithmeticEncoder:
         return num
 
     def compress(self, data: ndarray, frequencies=None) -> list:
-        """
-        压缩NumPy数组。
-
-        参数:
-            data: 要压缩的数组。
-            frequencies: 预定义的符号频率（可选）。
-
-        返回:
-            编码后的比特列表。
-        """
+        """Compress a NumPy array using supplied frequencies or an adaptive model."""
         data_str_list = self.ndarray2strlist(data)
 
         if frequencies is None:
-            # 自适应模型：从数据中自动提取频率
+            # Build the adaptive symbol model from the input data.
             _frequencies = list(set(data_str_list))
             freqs_bits = self.datastr2bits(_frequencies)
             auxbits = freqs_bits + self.integer2bits(len(_frequencies))
@@ -879,18 +586,9 @@ class CustomArithmeticEncoder:
             return data_bits
 
     def decompress(self, data_freqs_bits: list, frequencies=None) -> ndarray:
-        """
-        解压缩比特流。
-
-        参数:
-            data_freqs_bits: 编码的比特列表。
-            frequencies: 预定义的符号频率（可选）。
-
-        返回:
-            解压后的NumPy数组。
-        """
+        """Decompress bits using supplied frequencies or a serialized frequency table."""
         if frequencies is None:
-            # 从比特流末尾提取频率信息
+            # Extract the serialized frequency information from the bitstream suffix.
             len_bits_freqs = data_freqs_bits[-self.level_bits_len:]
             retain_bits = data_freqs_bits[:-self.level_bits_len]
             len_freqs = self.bits2integer(len_bits_freqs)
@@ -909,25 +607,25 @@ class CustomArithmeticEncoder:
         return np.asarray(data)
 
 
-# ==================== 主程序入口 ====================
+# ==================== Standalone entry point ====================
 if __name__ == "__main__":
-    # 测试 CustomArithmeticEncoder
-    print("测试 CustomArithmeticEncoder:")
+    # Exercise CustomArithmeticEncoder.
+    print("Testing CustomArithmeticEncoder:")
     message = np.round(np.random.randn(256, 256, 3)).astype(int)
     encoder = CustomArithmeticEncoder()
 
-    # 压缩
+    # Compress the data.
     bits = encoder.compress(message)
-    print(f"原始数据大小: {message.size} 个整数")
-    print(f"压缩后比特数: {len(bits)}")
-    print(f"压缩率: {len(bits) / (message.size * 8) * 100:.2f}%")
+    print(f"Original data size: {message.size} integers")
+    print(f"Compressed bit count: {len(bits)}")
+    print(f"Compression ratio: {len(bits) / (message.size * 8) * 100:.2f}%")
 
-    # 解压
+    # Decompress the data.
     ext_data = encoder.decompress(bits).reshape(message.shape)
-    print(f"解压成功: {np.array_equal(message, ext_data)}")
+    print(f"Decompression successful: {np.array_equal(message, ext_data)}")
 
-    # 测试固定频率模型
+    # Exercise the fixed-frequency model.
     # message = np.random.randint(0, 2, size=(256, 256, 3))
     # bits = encoder.compress(message, ["1", "0"])
     # ext_data = encoder.decompress(bits, ["1", "0"]).reshape(message.shape)
-    # print("固定频率解压成功:", np.array_equal(message, ext_data))
+    # print("Fixed-frequency decompression successful:", np.array_equal(message, ext_data))

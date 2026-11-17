@@ -1,22 +1,9 @@
-"""
-ALCLO 评估脚本
+"""ALCLO evaluation for base, adversarially trained, and score-guided models.
 
-功能:
-1. 加载 Phase 1 或 Phase 2 的 checkpoint
-2. 在已见攻击 (训练噪声池) 上测试
-3. 在未见攻击 (训练时从未出现) 上测试
-4. 输出对比表格
-
-支持两种模式:
-- 单模型评估:   python scripts/evaluate.py --checkpoint path/to/model.pth
-- 双模型对比:   python scripts/evaluate.py --checkpoint path/to/phase2.pth --baseline path/to/phase1.pth
-
-用法示例:
-    python scripts/evaluate.py \
-        --checkpoint checkpoints/phase2_adv_zreg/model_200.pth \
-        --baseline checkpoints/phase1_baseline/model_400.pth \
-        --dataset_path ../../DIV2K/val \
-        --num_images 50
+Evaluate configured seen/unseen attack groups and print comparison tables.
+Pass --checkpoint for the target iIWN, --baseline for an optional base
+network, and --score_checkpoint for optional score-guided latent optimization.
+See README.md for complete commands.
 """
 
 import os
@@ -38,29 +25,28 @@ from crmark.nets import Model
 from alclo.data import HideImage
 from torch.utils.data import DataLoader
 
-# Phase 3: score 网络 + z 优化器
+# Phase 3 Score Network and latent optimizer.
 from alclo.score.score_network import ScoreNetwork
 from alclo.score.z_optimizer import ZOptimizer
 
 warnings.filterwarnings("ignore")
 
 
-# ==================== 攻击实现 ====================
+# ==================== Distortion implementations ====================
 
 
 class AttackLibrary:
-    """
-    攻击库: 包含已见攻击和未见攻击的统一接口。
+    """Unified image distortion interface for evaluation.
 
-    所有攻击函数签名: attack(image_tensor) -> attacked_tensor
-    输入输出均为 (B, C, H, W) 范围 [0, 1] 的 float tensor。
+    Each attack maps float tensors shaped (B, C, H, W) in [0, 1] to attacked
+    tensors of the same shape.
     """
 
-    # ---------- 已见攻击 (训练噪声池中的 6 种) ----------
+    # ---------- Seen attacks: six distortions from the training pool ----------
 
     @staticmethod
     def jpeg(x, quality=50):
-        """JPEG 压缩 (逐张处理，用 PIL 实现)"""
+        """Apply JPEG compression to each image using Pillow."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -79,18 +65,18 @@ class AttackLibrary:
 
     @staticmethod
     def gaussian_noise(x, sigma=0.15):
-        """高斯噪声"""
+        """Add Gaussian noise."""
         return torch.clamp(x + torch.randn_like(x) * sigma, 0, 1)
 
     @staticmethod
     def gaussian_blur(x, sigma=3.0):
-        """高斯模糊"""
-        kernel_size = int(6 * sigma + 1) | 1  # 确保奇数
+        """Apply Gaussian blur."""
+        kernel_size = int(6 * sigma + 1) | 1  # Ensure an odd kernel size.
         return transforms.GaussianBlur(kernel_size, sigma)(x)
 
     @staticmethod
     def salt_pepper(x, p=0.3):
-        """椒盐噪声"""
+        """Add salt-and-pepper noise."""
         mask = torch.rand_like(x)
         result = x.clone()
         result[mask < p / 2] = 0.0
@@ -99,7 +85,7 @@ class AttackLibrary:
 
     @staticmethod
     def median_filter(x, kernel_size=9):
-        """中值滤波 (逐张处理)"""
+        """Apply a median filter to each image."""
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
         for i in range(B):
@@ -111,15 +97,15 @@ class AttackLibrary:
 
     @staticmethod
     def dropout(x, p=0.5):
-        """随机丢弃像素 (置零)"""
+        """Randomly set pixels to zero."""
         mask = (torch.rand_like(x) > p).float()
         return x * mask
 
-    # ---------- 未见攻击 (训练时从未出现) ----------
+    # ---------- Unseen attack benchmark group ----------
 
     @staticmethod
     def mean_filter(x, kernel_size=5):
-        """均值滤波"""
+        """Apply a mean filter."""
         C = x.shape[1]
         kernel = torch.ones(C, 1, kernel_size, kernel_size, device=x.device) / (kernel_size ** 2)
         pad = kernel_size // 2
@@ -127,7 +113,7 @@ class AttackLibrary:
 
     @staticmethod
     def sharpen(x, strength=1.0):
-        """锐化"""
+        """Sharpen the image."""
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
         for i in range(B):
@@ -135,24 +121,24 @@ class AttackLibrary:
             pil_img = transforms.ToPILImage()(img)
             sharp = pil_img.filter(ImageFilter.SHARPEN)
             sharp_t = transforms.ToTensor()(sharp).to(x.device)
-            # 按 strength 混合
+            # Blend according to strength.
             result[i] = torch.clamp(x[i] + strength * (sharp_t - x[i]), 0, 1)
         return result
 
     @staticmethod
     def brightness(x, delta=20):
-        """亮度调整 (delta 为像素值偏移量，范围 0-255 尺度)"""
+        """Adjust brightness using a pixel offset on the 0-255 scale."""
         return torch.clamp(x + delta / 255.0, 0, 1)
 
     @staticmethod
     def contrast(x, factor=0.8):
-        """对比度调整"""
+        """Adjust contrast."""
         mean = x.mean(dim=[2, 3], keepdim=True)
         return torch.clamp(mean + factor * (x - mean), 0, 1)
 
     @staticmethod
     def poisson_noise(x, lam=30.0):
-        """泊松噪声"""
+        """Add Poisson noise."""
         # noisy = torch.poisson(x * lam) / lam
         noisy = torch.poisson(torch.clamp(x * lam,min=0.0)) / lam
 
@@ -160,7 +146,7 @@ class AttackLibrary:
 
     @staticmethod
     def webp(x, quality=50):
-        """WebP 压缩"""
+        """Apply WebP compression."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -176,14 +162,14 @@ class AttackLibrary:
 
     @staticmethod
     def resize_attack(x, scale=0.5):
-        """缩放攻击: 缩小再放大"""
+        """Downsample and resize back to the original dimensions."""
         _, _, H, W = x.shape
         small = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
         return F.interpolate(small, size=(H, W), mode='bilinear', align_corners=False)
 
     @staticmethod
     def rotation(x, angle=5.0):
-        """小角度旋转 (旋转后裁剪回原尺寸,中心对齐)"""
+        """Rotate by a small angle and center-crop to the original dimensions."""
         B, C, H, W = x.shape
         theta = torch.tensor([
             [np.cos(np.deg2rad(angle)), -np.sin(np.deg2rad(angle)), 0],
@@ -195,7 +181,7 @@ class AttackLibrary:
 
     @staticmethod
     def center_crop_resize(x, crop_ratio=0.8):
-        """中心裁剪再放大回原尺寸"""
+        """Center-crop and resize back to the original dimensions."""
         _, _, H, W = x.shape
         ch, cw = int(H * crop_ratio), int(W * crop_ratio)
         top, left = (H - ch) // 2, (W - cw) // 2
@@ -204,7 +190,7 @@ class AttackLibrary:
 
     @staticmethod
     def jpeg2000(x, quality=30):
-        """JPEG2000 压缩 (通过 PIL 的 JP2 编码)"""
+        """Apply JPEG2000 compression using Pillow's JP2 codec."""
         import io
         B, C, H, W = x.shape
         result = torch.zeros_like(x)
@@ -224,7 +210,7 @@ class AttackLibrary:
 
     @staticmethod
     def motion_blur(x, kernel_size=9):
-        """运动模糊 (水平方向)"""
+        """Apply horizontal motion blur."""
         C = x.shape[1]
         kernel = torch.zeros(C, 1, kernel_size, kernel_size, device=x.device, dtype=x.dtype)
         kernel[:, :, kernel_size // 2, :] = 1.0 / kernel_size
@@ -233,7 +219,7 @@ class AttackLibrary:
 
     @staticmethod
     def hue_shift(x, shift=0.1):
-        """色调偏移 (仅 3 通道生效)"""
+        """Shift hue for three-channel RGB inputs."""
         if x.shape[1] != 3:
             return x
         B = x.shape[0]
@@ -248,14 +234,14 @@ class AttackLibrary:
 
     @staticmethod
     def chain(x, *fns):
-        """级联多个攻击"""
+        """Apply multiple attacks in sequence."""
         for fn in fns:
             x = fn(x)
         return x
 
 
 def get_seen_attacks():
-    """返回已见攻击配置 (与训练噪声池对齐)"""
+    """Return the seen-attack configurations aligned with the training noise pool."""
     atk = AttackLibrary
     return OrderedDict([
         # ("JPEG_Q10",          lambda x: atk.jpeg(x, quality=10)),
@@ -295,58 +281,57 @@ def get_seen_attacks():
 
 
 def get_unseen_attacks():
-    """
-    返回未见攻击配置 (训练时完全未出现) — 加强版
+    """Return the extended unseen-attack benchmark configurations.
 
-    目标: 避免天花板效应,让 Phase 1 vs Phase 2 的差异能显现出来。
-    策略: (1) 现有攻击加大参数  (2) 新增更强的攻击类型  (3) 级联攻击
+    Stronger filters, additional distortion types, and cascaded attacks help
+    avoid ceiling effects when comparing the base and Phase 2 networks.
     """
     atk = AttackLibrary
     return OrderedDict([
-        # ---- 线性滤波 (加大 kernel) ----
+        # ---- Linear filtering with larger kernels ----
         # ("MeanFilter_7",      lambda x: atk.mean_filter(x, kernel_size=7)),
         # ("MeanFilter_9",      lambda x: atk.mean_filter(x, kernel_size=9)),
         # ("MotionBlur_9",      lambda x: atk.motion_blur(x, kernel_size=9)),
         ("MotionBlur_15",     lambda x: atk.motion_blur(x, kernel_size=15)),
 
-        # ---- 锐化 (加大强度) ----
+        # ---- Stronger sharpening ----
         # ("Sharpen_1.5",       lambda x: atk.sharpen(x, strength=1.5)),
         ("Sharpen_2.0",       lambda x: atk.sharpen(x, strength=2.0)),
 
-        # ---- 亮度/对比度 (加大偏移) ----
+        # ---- Larger brightness and contrast changes ----
         # ("Brightness_-40",    lambda x: atk.brightness(x, delta=-40)),
         ("Brightness_+40",    lambda x: atk.brightness(x, delta=40)),
         # ("Contrast_0.5",      lambda x: atk.contrast(x, factor=0.5)),
         ("Contrast_1.6",      lambda x: atk.contrast(x, factor=1.6)),
 
-        # ---- 色调偏移 (新增) ----
+        # ---- Additional hue shift ----
         # ("HueShift_0.1",      lambda x: atk.hue_shift(x, shift=0.1)),
         # ("HueShift_0.2",      lambda x: atk.hue_shift(x, shift=0.2)),
 
-        # ---- 泊松噪声 (加大,lam 越小噪声越强) ----
+        # ---- Stronger Poisson noise: smaller lam produces more noise ----
         # ("Poisson_15",        lambda x: atk.poisson_noise(x, lam=15)),
         ("Poisson_8",         lambda x: atk.poisson_noise(x, lam=8)),
 
-        # ---- WebP 压缩 (加大压缩率) ----
+        # ---- Stronger WebP compression ----
         ("WebP_Q20",          lambda x: atk.webp(x, quality=20)),
         # ("WebP_Q10",          lambda x: atk.webp(x, quality=10)),
 
-        # ---- JPEG2000 (新增压缩类型) ----
+        # ---- Additional JPEG2000 compression ----
         # ("JPEG2000_Q30",      lambda x: atk.jpeg2000(x, quality=30)),
         # ("JPEG2000_Q15",      lambda x: atk.jpeg2000(x, quality=15)),
 
-        # ---- 缩放攻击 (加大,比例越小损失越多) ----
+        # ---- More aggressive resizing: smaller scale loses more information ----
         ("Resize_0.5x",       lambda x: atk.resize_attack(x, scale=0.5)),
         # ("Resize_0.35x",      lambda x: atk.resize_attack(x, scale=0.35)),
         # ("Resize_0.25x",      lambda x: atk.resize_attack(x, scale=0.25)),
 
-        # ---- 几何变换 (新增) ----
+        # ---- Additional geometric transformations ----
         ("Rotation_5deg",     lambda x: atk.rotation(x, angle=5.0)),
         # ("Rotation_10deg",    lambda x: atk.rotation(x, angle=10.0)),
         ("CenterCrop_0.8",    lambda x: atk.center_crop_resize(x, crop_ratio=0.8)),
         # ("CenterCrop_0.7",    lambda x: atk.center_crop_resize(x, crop_ratio=0.7)),
 
-        # ---- 级联攻击 (新增, 模拟真实 pipeline) ----
+        # ---- Cascaded attacks approximating image processing pipelines ----
         ("Resize_0.5+WebP_30", lambda x: atk.chain(
             x,
             lambda y: atk.resize_attack(y, scale=0.5),
@@ -365,18 +350,18 @@ def get_unseen_attacks():
     ])
 
 
-# ==================== 评估函数 ====================
+# ==================== Evaluation helpers ====================
 
 
 def compute_ber(w_hat, w):
-    """计算 BER (Bit Error Rate)"""
+    """Compute the bit error rate (BER)."""
     w_binary = (w > 0.5).float()
     w_hat_binary = (w_hat > 0.5).float()
     return torch.mean(torch.abs(w_binary - w_hat_binary)).item()
 
 
 def compute_psnr_np(img1, img2):
-    """计算 PSNR"""
+    """Compute PSNR."""
     mse = np.mean((img1 - img2) ** 2)
     if mse == 0:
         return float('inf')
@@ -384,9 +369,9 @@ def compute_psnr_np(img1, img2):
 
 
 def compute_ssim_torch(img1, img2, window_size=11, sigma=1.5):
-    """计算 SSIM，输入为 NCHW、取值范围 [0, 1] 的 tensor。"""
+    """Compute SSIM for NCHW image tensors with values in [0, 1]."""
     if img1.shape != img2.shape:
-        raise ValueError(f"SSIM 输入尺寸不一致: {img1.shape} vs {img2.shape}")
+        raise ValueError(f"SSIM input shapes differ: {img1.shape} vs {img2.shape}")
 
     _, channel, _, _ = img1.shape
     coords = torch.arange(window_size, dtype=img1.dtype, device=img1.device)
@@ -418,14 +403,14 @@ def compute_ssim_torch(img1, img2, window_size=11, sigma=1.5):
 
 def load_model(checkpoint_path, device, bit_length=64, im_size=256,
                channel_dim=3, k=5, min_size=16, fc=False):
-    """加载模型 checkpoint"""
+    """Load a watermark network checkpoint."""
     model = Model(im_size, channel_dim, bit_length, k, min_size, fc).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
-    # 读取 checkpoint 中的参数 (如果存在)
+    # Use checkpoint model settings when present.
     if 'param_dict' in ckpt:
         info = ckpt['param_dict']
         print(f"  bit_length={info.get('bit_length')}, img_size={info.get('img_size')}, "
@@ -435,9 +420,10 @@ def load_model(checkpoint_path, device, bit_length=64, im_size=256,
 
 
 def load_score_network(checkpoint_path, device, channel_dim=3):
-    """加载 Phase 3 训练的 score network checkpoint。
+    """Load a Phase 3 Score Network checkpoint.
 
-    checkpoint 里的 param_dict 记录了架构超参,优先使用;缺失时走默认值。
+    Prefer architecture settings recorded in param_dict, using defaults for
+    settings not present in the checkpoint.
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     params = ckpt.get('param_dict', {}) or {}
@@ -453,29 +439,24 @@ def load_score_network(checkpoint_path, device, channel_dim=3):
     score_net.eval()
 
     n_params = sum(p.numel() for p in score_net.parameters())
-    print(f"  score network 参数量: {n_params / 1e6:.2f}M, "
-          f"来自 epoch {ckpt.get('epoch', '?')}")
+    print(f"  Score Network parameters: {n_params / 1e6:.2f}M, "
+          f"from epoch {ckpt.get('epoch', '?')}")
     return score_net
 
 
 def evaluate_model(model, dataloader, attacks, device, desc="Evaluating",
                    z_optimizer=None):
-    """
-    在一组攻击下评估模型。
+    """Evaluate a model under a collection of attacks.
 
-    Args:
-        z_optimizer: 若提供,则使用 Phase 3 的 score-based z 优化逐张提取水印;
-                     否则走 DRRW 原始方法 (随机 z)。
-
-    返回:
-        results: dict[attack_name -> {"ber": float, "accuracy": float}]
-        quality: dict {"psnr": float, "ssim": float} stego 图像质量
+    Use per-image score-guided latent optimization when z_optimizer is given;
+    otherwise extract using random latent values. Return per-attack BER and
+    accuracy together with stego PSNR and SSIM.
     """
     results = OrderedDict()
     psnr_list = []
     ssim_list = []
 
-    # 先收集 stego 质量 (无攻击, 与 z 提取方式无关)
+    # Collect unattacked stego quality, independent of the latent extraction method.
     for cover, secret in dataloader:
         cover, secret = cover.to(device), secret.to(device)
         with torch.no_grad():
@@ -490,22 +471,22 @@ def evaluate_model(model, dataloader, attacks, device, desc="Evaluating",
     avg_psnr = np.mean(psnr_list)
     avg_ssim = np.mean(ssim_list)
 
-    # 逐攻击评估
+    # Evaluate each attack.
     for atk_name, atk_fn in tqdm(attacks.items(), desc=desc, ncols=100):
         ber_list = []
 
         for cover, secret in dataloader:
             cover, secret = cover.to(device), secret.to(device)
 
-            # 正向 + 攻击 (不需要梯度)
+            # Embedding and attacks do not require gradients.
             with torch.no_grad():
                 stego, z = model.forward(cover, secret, True, False)
                 stego_quant = torch.round(stego * 255.0) / 255.0
                 attacked = atk_fn(stego_quant)
 
-            # 水印提取: 两种路径
+            # Select the watermark extraction path.
             if z_optimizer is not None:
-                # Phase 3 路径: 逐张 score-based z 优化
+                # Phase 3: optimize z independently for each image.
                 B = attacked.shape[0]
                 w_hat_list = []
                 for i in range(B):
@@ -513,7 +494,7 @@ def evaluate_model(model, dataloader, attacks, device, desc="Evaluating",
                     w_hat_list.append(w_hat_i)
                 w_hat = torch.cat(w_hat_list, dim=0)
             else:
-                # DRRW 原始路径: 随机 z
+                # Base extraction path: random z.
                 with torch.no_grad():
                     rand_z = torch.randn_like(z)
                     _, w_hat = model.forward(attacked, rand_z, True, True)
@@ -530,11 +511,11 @@ def evaluate_model(model, dataloader, attacks, device, desc="Evaluating",
     return results, {"psnr": avg_psnr, "ssim": avg_ssim}
 
 
-# ==================== 结果展示 ====================
+# ==================== Result display ====================
 
 
 def print_results_table(results, quality, model_name="Model"):
-    """打印单模型结果表"""
+    """Print a single-model results table."""
     print(f"\n{'=' * 60}")
     print(f"  {model_name}")
     print(f"  Stego PSNR: {quality['psnr']:.2f} dB  |  SSIM: {quality['ssim']:.4f}")
@@ -551,7 +532,7 @@ def print_results_table(results, quality, model_name="Model"):
 
 def print_comparison_table(results1, quality1, results2, quality2,
                            name1="Phase1", name2="Phase2"):
-    """打印双模型对比表"""
+    """Print a comparison table for two models."""
     print(f"\n{'=' * 75}")
     print(f"  {name1} PSNR: {quality1['psnr']:.2f} dB, SSIM: {quality1['ssim']:.4f}  |  "
           f"{name2} PSNR: {quality2['psnr']:.2f} dB, SSIM: {quality2['ssim']:.4f}")
@@ -574,19 +555,15 @@ def print_comparison_table(results1, quality1, results2, quality2,
     print(f"  {'AVERAGE':<22} {avg1:>11.2%} {avg2:>11.2%} {marker}{abs(delta):>8.2%}")
 
 
-# ==================== 主函数 ====================
+# ==================== Main entry point ====================
 
 
 def _run_eval_category(cat_name, attacks, model, baseline, z_optimizer,
                        dataloader, device, checkpoint_basename):
-    """对一组攻击 (seen 或 unseen) 完整评估并打印对比表。
+    """Evaluate one attack category and print the model comparisons.
 
-    评估顺序:
-        1. Phase2 rand-z (永远跑)
-        2. Phase1 baseline (如提供) → 对比 Phase1 vs Phase2 rand-z
-        3. Phase2 z-opt (如提供 score) → 对比 Phase2 rand-z vs Phase2 z-opt
-
-    这样既保留原有 Phase1 vs Phase2 的对比, 又新增 Phase3 的增益验证。
+    Always evaluate Phase 2 with random z, optionally compare the Phase 1
+    baseline, then compare score-guided extraction when a score model is given.
     """
     print(f"\n{'#' * 60}")
     print(f"  {cat_name}")
@@ -596,7 +573,7 @@ def _run_eval_category(cat_name, attacks, model, baseline, z_optimizer,
     r_randz, q_randz = evaluate_model(
         model, dataloader, attacks, device, f"{cat_name} rand-z")
 
-    # (2) Phase1 对比
+    # (2) Compare with the Phase 1 baseline.
     if baseline is not None:
         r_base, q_base = evaluate_model(
             baseline, dataloader, attacks, device, f"{cat_name} Phase1")
@@ -605,7 +582,7 @@ def _run_eval_category(cat_name, attacks, model, baseline, z_optimizer,
     else:
         print_results_table(r_randz, q_randz, checkpoint_basename)
 
-    # (3) Phase3 z-opt 对比
+    # (3) Compare with Phase 3 latent optimization.
     if z_optimizer is not None:
         r_zopt, q_zopt = evaluate_model(
             model, dataloader, attacks, device,
@@ -615,29 +592,29 @@ def _run_eval_category(cat_name, attacks, model, baseline, z_optimizer,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ALCLO 模型评估")
+    parser = argparse.ArgumentParser(description="ALCLO model evaluation")
     parser.add_argument("--checkpoint", type=str, required=False, default="./checkpoints/phase2_R0_baseline/model_63.pth",
-                        help="要评估的模型 checkpoint 路径")
+                        help="Model checkpoint to evaluate")
     # parser.add_argument("--baseline", type=str, default="./checkpoints/phase1_baseline_lambda_z1e-3/model_486.pth",
-    #                     help="基线模型 checkpoint 路径 (用于对比)")
+    #                     help="Baseline model checkpoint for comparison")
     parser.add_argument("--baseline", type=str, default="../pretrain/crmark_color_size_256_bit_64.pth",
-                        help="基线模型 checkpoint 路径 (用于对比)")
+                        help="Baseline model checkpoint for comparison")
     parser.add_argument("--dataset_path", type=str, default="../../DIV2K/val",
-    #                     help="测试数据集路径")
+    #                     help="Evaluation image directory")
     # parser.add_argument("--dataset_path", type=str, default="../../Kodak24",
-    #                     help="测试数据集路径")
+    #                     help="Evaluation image directory")
     # parser.add_argument("--dataset_path", type=str, default="../../AID",
-    #                     help="测试数据集路径")
+    #                     help="Evaluation image directory")
     # parser.add_argument("--dataset_path", type=str, default="../../DiffusionDB",
-    #                     help="测试数据集路径")
+    #                     help="Evaluation image directory")
     # parser.add_argument("--dataset_path", type=str, default="../../CelebA-HQ",
-    #                     help="测试数据集路径")
+    #                     help="Evaluation image directory")
     # parser.add_argument("--dataset_path", type=str, default="../../COCO/test",
-                        help="测试数据集路径")
+                        help="Evaluation image directory")
     parser.add_argument("--num_images", type=int, default=100,
-                        help="测试图像数量 (0=全部)")
+                        help="Number of evaluation images (0 = all)")
     parser.add_argument("--seed", type=int, default=42,
-                        help="随机抽样种子")
+                        help="Random sampling seed")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--im_size", type=int, default=256)
     parser.add_argument("--channel_dim", type=int, default=3)
@@ -646,32 +623,32 @@ def main():
     parser.add_argument("--min_size", type=int, default=16)
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--skip_seen", action="store_true",
-                        help="跳过已见攻击测试")
+                        help="Skip the seen-attack group")
     parser.add_argument("--skip_unseen", action="store_true",
-                        help="跳过未见攻击测试")
+                        help="Skip the unseen-attack group")
     parser.add_argument("--skip_phase3", action="store_true",
-                        help="跳过 Phase 3 (score-based z 优化) 评估; 只测 Phase 1/2 rand-z 路径")
+                        help="Skip Phase 3 score-guided optimization; evaluate Phase 1/2 random-z extraction only")
 
-    # ---- Phase 3: score-based z 优化 ----
+    # ---- Phase 3: score-guided latent optimization ----
     parser.add_argument("--score_checkpoint", type=str, default="./checkpoints/phase3_hybrid/score_model_61.pth",
-                        help="Phase 3 score network checkpoint 路径;不提供则跳过 z 优化评估")
+                        help="Phase 3 Score Network checkpoint; omit to skip latent optimization")
     parser.add_argument("--z_opt_steps", type=int, default=30,
-                        help="z 优化步数")
+                        help="Number of latent optimization steps")
     parser.add_argument("--z_opt_lr", type=float, default=0.05,
-                        help="z 优化学习率")
+                        help="Latent optimization learning rate")
     parser.add_argument("--z_opt_sigma", type=float, default=0.05,
-                        help="z 优化时 score network 的 σ")
+                        help="Score Network sigma during latent optimization")
     parser.add_argument("--z_opt_lambda_prior", type=float, default=0.5,
-                        help="z 先验项权重")
+                        help="Latent prior penalty weight")
     parser.add_argument("--z_opt_lambda_ent", type=float, default=0.3,
-                        help="水印熵项权重")
+                        help="Watermark entropy penalty weight")
 
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}")
+    print(f"Device: {device}")
 
-    # 数据集
+    # Load the evaluation dataset.
     dataset = HideImage(args.dataset_path, args.im_size, args.bit_length, args.channel_dim)
     if args.num_images > 0:
         if hasattr(dataset, "cover"):
@@ -681,27 +658,27 @@ def main():
         generator = torch.Generator().manual_seed(args.seed)
         indices = torch.randperm(total_images, generator=generator)[:num_selected].tolist()
         dataset = torch.utils.data.Subset(dataset, indices)
-        print(f"随机抽样: {num_selected}/{total_images} 张, seed={args.seed}")
+        print(f"Random sample: {num_selected}/{total_images} images, seed={args.seed}")
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
-    print(f"测试集: {len(dataset)} 张图像")
+    print(f"Evaluation set: {len(dataset)} images")
 
-    # 加载模型
-    print(f"\n加载模型: {args.checkpoint}")
+    # Load the models.
+    print(f"\nLoading model: {args.checkpoint}")
     model = load_model(args.checkpoint, device, args.bit_length, args.im_size,
                        args.channel_dim, args.k, args.min_size)
 
     baseline = None
     if args.baseline:
-        print(f"加载基线: {args.baseline}")
+        print(f"Loading baseline: {args.baseline}")
         baseline = load_model(args.baseline, device, args.bit_length, args.im_size,
                               args.channel_dim, args.k, args.min_size)
 
-    # ---- 加载 score 网络并构建 z 优化器 (如提供且未跳过) ----
+    # ---- Load the optional score network and construct the latent optimizer ----
     z_optimizer = None
     if args.skip_phase3:
-        print("\n[跳过 Phase 3 评估] --skip_phase3 已设置, 不加载 score network")
+        print("\n[Skipping Phase 3] --skip_phase3 is set; the Score Network will not be loaded")
     elif args.score_checkpoint:
-        print(f"\n加载 score network: {args.score_checkpoint}")
+        print(f"\nLoading Score Network: {args.score_checkpoint}")
         score_net = load_score_network(args.score_checkpoint, device, args.channel_dim)
         z_optimizer = ZOptimizer(
             iiwn_model=model,
@@ -714,25 +691,25 @@ def main():
             lambda_ent=args.z_opt_lambda_ent,
             device=device,
         )
-        print(f"  z-opt 超参: steps={args.z_opt_steps}, lr={args.z_opt_lr}, "
+        print(f"  z-opt settings: steps={args.z_opt_steps}, lr={args.z_opt_lr}, "
               f"σ={args.z_opt_sigma}, λ_prior={args.z_opt_lambda_prior}, "
               f"λ_ent={args.z_opt_lambda_ent}")
 
-    # 攻击配置
+    # Attack configurations.
     seen_attacks = get_seen_attacks() if not args.skip_seen else OrderedDict()
     unseen_attacks = get_unseen_attacks() if not args.skip_unseen else OrderedDict()
 
     ckpt_name = os.path.basename(args.checkpoint)
 
     if seen_attacks:
-        _run_eval_category("已见攻击 (Seen Attacks)", seen_attacks,
+        _run_eval_category("Seen Attacks", seen_attacks,
                            model, baseline, z_optimizer, dataloader, device, ckpt_name)
 
     if unseen_attacks:
-        _run_eval_category("未见攻击 (Unseen Attacks) — 核心对比", unseen_attacks,
+        _run_eval_category("Unseen Attacks -- main comparison", unseen_attacks,
                            model, baseline, z_optimizer, dataloader, device, ckpt_name)
 
-    print("\n评估完成。")
+    print("\nEvaluation complete.")
 
 
 if __name__ == "__main__":

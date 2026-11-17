@@ -1,26 +1,13 @@
-"""
-ALCLO Phase 2 训练脚本: 联合训练 (unified).
+"""ALCLO Phase 2: joint latent regularization and adversarial training.
 
-设计要点:
-1. 从 Phase 1 ckpt 起步, z 分布迁移 + 对抗训练联合进行
-2. z reg 温和 (lambda_z_std 5e-3, 允许 z_std ~2-3),
-   Phase 3 score network 会学真实 p(z), 不强求 z=N(0,1)
-3. attacker warmup — 前若干 epoch 冻结 iIWN 只训 attacker,
-   让 attacker 先找到攻击方向, 避免 iIWN 压死 attacker 信号
+Start from Phase 1 weights, use moderate latent distribution penalties,
+and warm up the attacker while freezing iIWN. Phase 3 learns corrections
+for reconstructions from the resulting latent distribution.
 
-PSNR 守门:
-    val_psnr < baseline - tolerance 时动态降 eps_max (系数 0.9).
-    仅 psnr_ok 的 epoch 计入 best ckpt.
-
-默认配置 = R0 baseline (敏感性分析的 baseline). 改超参直接命令行覆盖即可.
-    p_adv          = 0.35
-    lambda_z_std   = 5e-3
-    eps_max        = 12/255
-
-用法:
-    python scripts/train_phase2.py \
-        --phase1_checkpoint ./checkpoints/phase1_baseline/model_best.pth \
-        --train_name phase2_R0_baseline
+If validation PSNR falls below baseline minus tolerance, reduce eps_max
+by a factor of 0.9. Only epochs passing the PSNR check can become the
+best checkpoint. Override experiment settings through command-line options;
+see README.md for complete commands.
 """
 
 import os
@@ -54,12 +41,12 @@ from watermarklab.noiselayers.noiselayerloader import DigitalDistortion
 warnings.filterwarnings("ignore")
 
 
-# ==================== 训练核心函数 ====================
+# ==================== Training steps ====================
 
 
 def train_batch_iiwn(model, hybrid_noise, args, cover, secret, now_epoch,
                      z_dist_loss_fn, eps):
-    """iIWN 单批次训练 (hybrid noise = 固定噪声 + 对抗噪声)."""
+    """Train one iIWN batch with hybrid fixed and adversarial distortions."""
     stego, z = model.forward(cover, secret, args.hard_round, False)
     noised, _ = hybrid_noise(stego, cover, now_epoch, eps)
 
@@ -99,7 +86,7 @@ def train_batch_iiwn(model, hybrid_noise, args, cover, secret, now_epoch,
 
 
 def train_batch_attacker(model, attacker, args, cover, secret, adv_loss_fn, eps):
-    """攻击器单批次训练 (独立计算图, iIWN 冻结)."""
+    """Train the attacker on a separate computation graph with iIWN frozen."""
     with torch.no_grad():
         stego, z = model.forward(cover, secret, True, False)
     stego_detached = stego.detach()
@@ -125,7 +112,7 @@ def train_batch_attacker(model, attacker, args, cover, secret, adv_loss_fn, eps)
 
 
 def val_noise_batch(model, args, noise_layer, intensity, val_cover, val_secret):
-    """在指定噪声下验证单批次."""
+    """Validate one batch under the specified distortion."""
     val_stego, val_z = model.forward(val_cover, val_secret, True, False)
     val_noised = noise_layer.test(quantize_image(val_stego), val_cover, intensity)
     val_noised_quant = quantize_image(val_noised)
@@ -137,10 +124,10 @@ def val_noise_batch(model, args, noise_layer, intensity, val_cover, val_secret):
 
 
 def run_validation(model, val_loader, test_noiselayer, args):
-    """跑完整验证集: 先算无攻击 PSNR, 再算每种噪声下的 accuracy."""
+    """Measure clean stego PSNR and extraction accuracy under each validation noise."""
     model.eval()
     with torch.no_grad():
-        # 1) 无攻击的 stego PSNR
+        # 1. Measure clean stego PSNR.
         psnr_list = []
         for val_cover, val_secret in val_loader:
             val_cover = val_cover.to(args.device)
@@ -149,7 +136,7 @@ def run_validation(model, val_loader, test_noiselayer, args):
             psnr_list.append(compute_psnr(val_stego, val_cover))
         avg_psnr = float(np.mean(psnr_list))
 
-        # 2) 逐噪声准确率
+        # 2. Measure accuracy under each distortion.
         acc_dict = {}
         for key in test_noiselayer.noise_dict.keys():
             acc_per_noise = []
@@ -168,7 +155,7 @@ def run_validation(model, val_loader, test_noiselayer, args):
     return avg_psnr, avg_acc, acc_dict
 
 
-# ==================== 主训练函数 ====================
+# ==================== Training loop ====================
 
 
 def train(args):
@@ -185,31 +172,31 @@ def train(args):
     os.makedirs(ckpt_dir, exist_ok=True)
     writer = SummaryWriter(log_path)
 
-    # 训练参数写入 TensorBoard (markdown 表)
+    # Record the configuration as a Markdown table in TensorBoard.
     args_md_lines = ["| Argument | Value |", "| --- | --- |"]
     for k, v in vars(args).items():
         args_md_lines.append(f"| {k} | {v} |")
     writer.add_text("args", "\n".join(args_md_lines), 0)
 
-    # ---- 创建 iIWN 并加载 Phase 1 ckpt ----
+    # ---- Create iIWN and load Phase 1 weights ----
     model = Model(
         img_size=args.im_size, channel_dim=args.channel_dim,
         bit_length=args.bit_length, k=args.k,
         min_size=args.min_size, fc=args.fc,
     ).to(args.device)
 
-    # 仅在不是断点续训时才加载 Phase 1 ckpt; 续训时下面的最新 ckpt 会覆盖一切
+    # Skip Phase 1 loading when resuming; the latest checkpoint restores all state below.
     latest_ckpt_path = find_latest_model(ckpt_dir) if args.continue_train else None
     if latest_ckpt_path is None:
-        print(f"\n加载 Phase 1 checkpoint: {args.phase1_checkpoint}")
+        print(f"\nLoading Phase 1 checkpoint: {args.phase1_checkpoint}")
         upstream_dict = torch.load(args.phase1_checkpoint, map_location="cpu", weights_only=False)
         model.load_state_dict(upstream_dict['model_state_dict'])
         args.lambda_secret = args.lambda_secret_reset
-        print(f"重置 lambda_secret = {args.lambda_secret} (Phase 2 起点)")
+        print(f"Reset lambda_secret = {args.lambda_secret} (Phase 2 initialization)")
     else:
-        print(f"\n检测到最新 ckpt {latest_ckpt_path}, 跳过 Phase 1 加载")
+        print(f"\nLatest checkpoint found: {latest_ckpt_path}; skipping Phase 1 loading")
 
-    # ---- 噪声层 ----
+    # ---- Distortion layers ----
     train_noiselayer = DigitalDistortion(noise_dict=args.train_noise_dict, max_step=args.max_step)
     test_noiselayer = DigitalDistortion(noise_dict=args.test_noise_dict, max_step=args.max_step)
 
@@ -222,7 +209,7 @@ def train(args):
 
     iiwn_params = sum(p.numel() for p in model.parameters())
     atk_params = sum(p.numel() for p in attacker.parameters())
-    print(f"iIWN: {iiwn_params / 1e6:.2f}M, 攻击器: {atk_params / 1e6:.2f}M")
+    print(f"iIWN: {iiwn_params / 1e6:.2f}M, attacker: {atk_params / 1e6:.2f}M")
 
     hybrid_noise = HybridNoiseLayer(
         attacker=attacker,
@@ -235,7 +222,7 @@ def train(args):
     )
     optim_atk = Adam(attacker.parameters(), lr=args.atk_lr, betas=(0.9, 0.999))
 
-    # 目标权重 (warmup 时相对它缩放)
+    # Target weights used to scale the warmup schedule.
     target_lambda_z_mean = args.lambda_z_mean
     target_lambda_z_std = args.lambda_z_std
     target_lambda_z_skew = args.lambda_z_skew
@@ -248,7 +235,7 @@ def train(args):
     optim_iiwn = AdamW(model.inn_blocks.parameters(), lr=args.lr, betas=(0.5, 0.999),
                        eps=1e-6, weight_decay=1e-5)
 
-    # ---- 数据加载 ----
+    # ---- Image datasets ----
     train_dataset = HideImage(args.dataset_path, args.im_size, args.bit_length, args.channel_dim)
     val_dataset = HideImage(args.val_dataset_path, args.im_size, args.bit_length, args.channel_dim)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -256,7 +243,7 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True,
                             drop_last=True, pin_memory=True)
 
-    # ---- 断点续训 ----
+    # ---- Checkpoint resume ----
     start_epoch = 0
     global_step = 0
     resumed_eps_max = None
@@ -272,18 +259,18 @@ def train(args):
         global_step = ckpt['global_step']
         args.lambda_secret = ckpt['lambda_secret']
         resumed_eps_max = ckpt.get('current_eps_max', None)
-        print(f"从 epoch {start_epoch} 继续训练 (lambda_secret={args.lambda_secret:.4f}"
+        print(f"Resuming from epoch {start_epoch} (lambda_secret={args.lambda_secret:.4f}"
               + (f", current_eps_max={resumed_eps_max:.4f}" if resumed_eps_max is not None else "")
               + ")")
 
-    # ---- 训练循环状态 ----
+    # ---- Training state ----
     model.train()
     attacker.train()
 
     average_acc_queue = []
     best_acc_in_safe_zone = -float('inf')
     best_epoch = -1
-    current_eps_max = resumed_eps_max if resumed_eps_max is not None else args.eps_max  # 守门会动态下调
+    current_eps_max = resumed_eps_max if resumed_eps_max is not None else args.eps_max  # The PSNR guardrail can reduce this value dynamically.
 
     atk_warmup = max(int(args.attacker_warmup_epochs), 0)
 
@@ -291,7 +278,7 @@ def train(args):
     for epoch in tqdm(range(remaining), position=0, desc="Phase2", ncols=100):
         now_epoch = epoch + start_epoch + 1
 
-        # attacker warmup: 前 atk_warmup 个 epoch 冻结 iIWN, 只训 attacker
+        # During attacker warmup, freeze iIWN and train only the attacker.
         in_atk_warmup = (epoch < atk_warmup)
 
         if in_atk_warmup:
@@ -302,7 +289,7 @@ def train(args):
             eps = get_eps_schedule(sched_epoch, sched_total, args.eps_min, current_eps_max)
         writer.add_scalar("train/in_atk_warmup", float(in_atk_warmup), now_epoch)
 
-        # z-dist warmup: lambda_z_* 按 [start_scale, 1.0] 线性 ramp
+        # Linearly ramp lambda_z_* from start_scale to full weight during latent warmup.
         warmup_ep = max(args.zdist_warmup_epochs, 0)
         if warmup_ep > 0:
             progress = min(epoch / warmup_ep, 1.0)
@@ -314,14 +301,14 @@ def train(args):
         z_dist_loss_fn.lambda_skew = target_lambda_z_skew * scale
         writer.add_scalar("train/zdist_warmup_scale", scale, now_epoch)
 
-        # lambda_secret 自适应衰减
+        # Adaptively decay lambda_secret.
         if len(average_acc_queue) >= args.queue_len:
             if np.mean(average_acc_queue) > 1. - args.delta:
                 new_val = args.lambda_secret * args.v
                 if new_val >= args.lambda_secret_floor:
                     args.lambda_secret = new_val
                     average_acc_queue.clear()
-                    print(f"lambda_secret 衰减为: {args.lambda_secret:.4f}")
+                    print(f"lambda_secret decayed to: {args.lambda_secret:.4f}")
 
         loss_list = []
         acc_list = []
@@ -331,7 +318,7 @@ def train(args):
             cover = cover.to(args.device)
             secret = secret.to(args.device)
 
-            # ---- iIWN 更新 (warmup 期间跳过) ----
+            # ---- Update iIWN, except during attacker warmup ----
             if in_atk_warmup:
                 with torch.no_grad():
                     iiwn_result = train_batch_iiwn(
@@ -348,7 +335,7 @@ def train(args):
                 iiwn_result["loss"].backward()
                 optim_iiwn.step()
 
-            # ---- attacker 更新 (每个 batch) ----
+            # ---- Update the attacker on every batch ----
             atk_result = train_batch_attacker(
                 model, attacker, args, cover, secret, adv_loss_fn, eps,
             )
@@ -375,9 +362,9 @@ def train(args):
         if len(average_acc_queue) > args.queue_len:
             average_acc_queue.pop(0)
 
-        # ---- 验证 + 保存 + 守门 ----
+        # ---- Validation, checkpointing, and PSNR guardrail ----
         if (now_epoch - 1) % args.val_save_epoch == 0:
-            print(f"\n验证 epoch {now_epoch}...")
+            print(f"\nValidating epoch {now_epoch}...")
             avg_val_psnr, avg_val_acc, acc_dict = run_validation(
                 model, val_loader, test_noiselayer, args,
             )
@@ -398,14 +385,14 @@ def train(args):
             for k, v in acc_dict.items():
                 print(f"    {k:<20} {v:.4f}")
 
-            # 守门: PSNR 破下限 → 降 eps_max
+            # Reduce eps_max when PSNR drops below the permitted threshold.
             if avg_val_psnr < args.baseline_psnr - args.psnr_tolerance:
                 old_eps = current_eps_max
                 current_eps_max = max(current_eps_max * 0.9, args.eps_min)
-                print(f"  [GUARDRAIL] PSNR 低于 baseline - {args.psnr_tolerance:.2f}, "
+                print(f"  [GUARDRAIL] PSNR below baseline - {args.psnr_tolerance:.2f}, "
                       f"eps_max {old_eps:.4f} -> {current_eps_max:.4f}")
 
-            # 最优 ckpt: 只有 psnr_ok 才进入候选区
+            # Only epochs passing the PSNR check can become the best checkpoint.
             score = avg_val_acc + 0.005 * avg_val_psnr
             writer.add_scalar("val/score", score, now_epoch)
             writer.add_scalar("val/psnr_ok", float(psnr_ok), now_epoch)
@@ -413,9 +400,9 @@ def train(args):
             if psnr_ok and avg_val_acc > best_acc_in_safe_zone:
                 best_acc_in_safe_zone = avg_val_acc
                 best_epoch = now_epoch
-                print(f"  [BEST] 进入守门区的新最优 epoch (acc={avg_val_acc:.4f})")
+                print(f"  [BEST] New best eligible epoch (acc={avg_val_acc:.4f})")
 
-            # 保存 checkpoint
+            # Save the checkpoint.
             save_dict = {
                 'model_state_dict': model.state_dict(),
                 'attacker_state_dict': attacker.state_dict(),
@@ -441,30 +428,30 @@ def train(args):
 
             save_path = os.path.join(ckpt_dir, f"model_{now_epoch}.pth")
             torch.save(save_dict, save_path)
-            print(f"  checkpoint 已保存: {save_path}\n")
+            print(f"  Checkpoint saved: {save_path}\n")
 
-            # 同步保存 best ckpt
+            # Also save the best checkpoint when eligible.
             if best_epoch == now_epoch:
                 best_path = os.path.join(ckpt_dir, "model_best.pth")
                 torch.save(save_dict, best_path)
                 writer.add_scalar("val/best_val_acc", best_acc_in_safe_zone, now_epoch)
 
     writer.close()
-    print("\nPhase 2 训练完成.")
+    print("\nPhase 2 training complete.")
     if best_epoch > 0:
-        print(f"守门区内最优 epoch: {best_epoch} (acc={best_acc_in_safe_zone:.4f})")
-        print(f"最优 ckpt: {os.path.join(ckpt_dir, 'model_best.pth')}")
+        print(f"Best eligible epoch: {best_epoch} (acc={best_acc_in_safe_zone:.4f})")
+        print(f"Best checkpoint: {os.path.join(ckpt_dir, 'model_best.pth')}")
     else:
-        print("警告: 全程没有 epoch 达到 PSNR >= baseline.")
-        print("      请检查 TensorBoard 的 train/train_stego_psnr 和 val/psnr 曲线,")
-        print("      可能需要降低 lr、降低 lambda_z_std 或进一步降低对抗强度.")
+        print("Warning: no epoch reached PSNR >= baseline.")
+        print("         Inspect TensorBoard train/train_stego_psnr and val/psnr curves.")
+        print("         Consider reducing lr, lambda_z_std, or the adversarial strength.")
 
 
-# ==================== 参数配置 ====================
+# ==================== Argument configuration ====================
 
 
 def main():
-    # 训练 / 测试噪声字典 (Phase 1 用同一套, 保持一致)
+    # Use training/validation distortion dictionaries consistent with Phase 1.
     train_noise_dict = {
         "Jpeg": 30, "GaussianBlur": 1.5, "GaussianNoise": 0.15,
         "SaltPepperNoise": 0.15, "MedianFilter": 7, "Dropout": 0.3,
@@ -475,27 +462,27 @@ def main():
     }
 
     parser = argparse.ArgumentParser(
-        description="ALCLO Phase 2 联合训练 (z 分布迁移 + 对抗微调)"
+        description="ALCLO Phase 2: joint latent regularization and adversarial fine-tuning"
     )
 
-    # ---- 上游 ----
+    # ---- Input checkpoint ----
     parser.add_argument("--phase1_checkpoint", type=str,
                         default="../pretrain/crmark_color_size_256_bit_64.pth",
-                        help="Phase 1 最终模型路径 (起点)")
+                        help="Phase 1 checkpoint used to initialize training")
 
-    # ---- Baseline (PSNR 守门阈值) ----
+    # ---- Baseline measurements for the PSNR guardrail ----
     parser.add_argument("--baseline_psnr", type=float, default=40.0,
-                        help="Phase 1 val PSNR baseline; 跑前请改成你新 Phase 1 的实测 PSNR")
+                        help="Measured Phase 1 validation PSNR on your validation set")
     parser.add_argument("--baseline_seen_acc", type=float, default=0.980,
-                        help="Phase 1 seen 平均精度 (仅展示, 守门主看 PSNR)")
+                        help="Mean Phase 1 seen-attack accuracy, for display only; the guardrail uses PSNR")
     parser.add_argument("--psnr_tolerance", type=float, default=2.0,
-                        help="PSNR 守门容忍度: val_psnr < baseline-tol 触发 eps_max 降级")
+                        help="PSNR tolerance: reduce eps_max when val_psnr < baseline - tolerance")
 
-    # ---- 设备 ----
+    # ---- Device settings ----
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
 
-    # ---- 数据 ----
+    # ---- Dataset settings ----
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--dataset_path", type=str, default=r"../../DIV2K/train")
     parser.add_argument("--val_dataset_path", type=str, default=r"../../DIV2K/val")
@@ -511,9 +498,9 @@ def main():
     parser.add_argument("--fc", type=bool, default=False)
     parser.add_argument("--hard_round", type=bool, default=False)
 
-    # ---- 训练循环 ----
+    # ---- Training loop settings ----
     parser.add_argument("--train_name", type=str, default="phase2_C2_eps_20_255）",
-                        help="checkpoint / tensorboard 目录名")
+                        help="Checkpoint and TensorBoard experiment directory name")
     parser.add_argument("--num_epoch", type=int, default=70)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max_step", type=int, default=1)
@@ -522,39 +509,39 @@ def main():
     parser.add_argument("--queue_len", type=int, default=3)
     parser.add_argument("--continue_train", type=bool, default=False)
 
-    # ---- iIWN loss 权重 ----
+    # ---- iIWN loss weights ----
     parser.add_argument("--lambda_stego", type=float, default=2.0)
     parser.add_argument("--lambda_lpips", type=float, default=8.0)
     parser.add_argument("--lambda_secret_reset", type=float, default=1e2,
-                        help="进入 Phase 2 时 lambda_secret 重置值 (轻度重置, 不冲击 Phase 1 学到的分布)")
+                        help="Reset value of lambda_secret at Phase 2 initialization")
     parser.add_argument("--lambda_secret_floor", type=float, default=10.0)
     parser.add_argument("--lambda_penalty", type=float, default=1e6)
     parser.add_argument("--v", type=float, default=0.9)
     parser.add_argument("--delta", type=float, default=0.005)
 
-    # ---- z 分布正则 (R0 baseline) ----
+    # ---- Latent distribution regularization (R0 baseline) ----
     parser.add_argument("--lambda_z_mean", type=float, default=5e-4)
     parser.add_argument("--lambda_z_std", type=float, default=5e-3,
-                        help="★ 敏感性分析超参 1 (B 组: 1e-3 / 5e-3 / 5e-2)")
+                        help="Sensitivity setting 1 (group B): 1e-3 / 5e-3 / 5e-2")
     parser.add_argument("--lambda_z_skew", type=float, default=1e-3)
     parser.add_argument("--zdist_warmup_epochs", type=int, default=10)
     parser.add_argument("--zdist_warmup_start_scale", type=float, default=0.1)
-    # ---- 对抗训练 (R0 baseline, v1 4-ResBlock CNN attacker) ----
+    # ---- Adversarial training (R0 baseline, residual CNN attacker) ----
     parser.add_argument("--p_adv", type=float, default=0.35,
-                        help="★ 敏感性分析超参 2 (A 组: 0.15 / 0.35 / 0.55)")
+                        help="Sensitivity setting 2 (group A): 0.15 / 0.35 / 0.55")
     parser.add_argument("--eps_min", type=float, default=2.0 / 255)
     parser.add_argument("--eps_max", type=float, default=20.0 / 255,
-                        help="★ 敏感性分析超参 3 (C 组: 6/255 / 12/255 / 20/255)")
+                        help="Sensitivity setting 3 (group C): 6/255 / 12/255 / 20/255")
     parser.add_argument("--tau_psnr", type=float, default=32.0)
     parser.add_argument("--lambda_constraint", type=float, default=5.0)
     parser.add_argument("--atk_lr", type=float, default=8e-5,
-                        help="v1 CNN attacker 用 8e-5 收敛快")
+                        help="Attacker learning rate (8e-5 for the residual CNN configuration)")
     parser.add_argument("--attacker_warmup_epochs", type=int, default=5,
-                        help="前 N epoch 冻结 iIWN 只训 attacker")
+                        help="Freeze iIWN and train only the attacker for the first N epochs")
     parser.add_argument("--atk_hidden_channels", type=int, default=64)
     parser.add_argument("--atk_num_blocks", type=int, default=4)
 
-    # ---- 路径 ----
+    # ---- Output paths ----
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/")
     parser.add_argument("--logs_path", type=str, default="logs")
 
