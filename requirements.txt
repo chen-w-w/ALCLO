@@ -1,0 +1,15 @@
+# Direct dependencies for the model, training and evaluation scripts.
+# Install a torch/torchvision pair suitable for your CUDA environment first.
+# This is a dependency list, not a fully pinned reproduction environment.
+torch
+torchvision
+numpy
+Pillow
+tqdm
+requests
+lpips
+bchlib
+kornia
+prettytable
+tensorboard
+watermarklab
